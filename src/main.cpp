@@ -331,14 +331,8 @@ void write_cart_ram_file(struct gb_s* gb) {
     gb_get_rom_name(gb, filename);
     save_size = gb_get_save_size(gb);
     if (save_size > 0) {
-        FRESULT fr = f_mount(&fs, "", 1);
-        if (FR_OK != fr) {
-            printf("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-            return;
-        }
-
         FIL fil;
-        fr = f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
+        FRESULT fr = f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
         if (fr == FR_OK) {
             f_write(&fil, ram, save_size, &bw);
         }
@@ -462,11 +456,6 @@ void __not_in_flash_func(filebrowser)(const char pathname[256], const char execu
 
     DIR dir;
     FILINFO fileInfo;
-
-    if (FR_OK != f_mount(&fs, "SD", 1)) {
-        draw_text("SD Card not inserted or SD Card error!", 0, 0, 12, 0);
-        while (true);
-    }
 
     while (true) {
         memset(fileItems, 0, sizeof(file_item_t) * max_files);
@@ -678,7 +667,7 @@ bool overclock() {
 #if PICO_RP2350
     volatile uint32_t *qmi_m0_timing=(uint32_t *)0x400d000c;
     vreg_disable_voltage_limit();
-    vreg_set_voltage(VREG_VOLTAGE_1_40);
+    vreg_set_voltage(VREG_VOLTAGE_1_60);
     sleep_ms(10);
     *qmi_m0_timing = 0x60007204;
     set_sys_clock_khz(frequencies[frequency_index] * KHZ, false);
@@ -703,11 +692,9 @@ static bool save() {
         sprintf(pathname, "%s\\%s.save", HOME_DIR, filename);
     }
 
-    FRESULT fr = f_mount(&fs, "", 1);
     FIL fd;
-    fr = f_open(&fd, pathname, FA_CREATE_ALWAYS | FA_WRITE);
+    f_open(&fd, pathname, FA_CREATE_ALWAYS | FA_WRITE);
     UINT bw;
-
     f_write(&fd, &gb, sizeof(gb), &bw);
     f_write(&fd, ram, sizeof(ram), &bw);
     f_close(&fd);
@@ -727,15 +714,12 @@ static bool load() {
         sprintf(pathname, "GB\\%s.save", filename);
     }
 
-    FRESULT fr = f_mount(&fs, "", 1);
     FIL fd;
-    fr = f_open(&fd, pathname, FA_READ);
+    f_open(&fd, pathname, FA_READ);
     UINT br;
-
     f_read(&fd, &gb, sizeof(gb), &br);
     f_read(&fd, ram, sizeof(ram), &br);
     f_close(&fd);
-
     return true;
 }
 #if SOFTTV
@@ -964,7 +948,9 @@ int main() {
     if (FR_OK != fr) {
         printf("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
         /// TODO: error handling
+        while(1);
     } else {
+        f_mkdir(HOME_DIR);
         f_load_conf();
     }
 

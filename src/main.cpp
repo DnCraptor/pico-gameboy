@@ -83,10 +83,61 @@ uint16_t stream[AUDIO_BUFFER_SIZE_BYTES];
 #define RGB565_TO_RGB888(rgb565) ((((rgb565) & 0xF800) << 8) | (((rgb565) & 0x07E0) << 5) | (((rgb565) & 0x001F) << 3))
 #endif
 
+static inline uint32_t rgb565_to_rgb888(uint16_t c) { return ((uint32_t)(c & 0xF800) << 8) | ((uint32_t)(c & 0x07E0) << 5) | ((uint32_t)(c & 0x001F) << 3); }
+static inline uint16_t rgb888_to_rgb565(uint32_t c) { return (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F)); }
+static inline uint32_t custom_to_driver_color(uint32_t c) {
+#if TFT
+    return rgb888_to_rgb565(c);
+#else
+    return c;
+#endif
+}
+
 typedef uint32_t palette222_t[3][4];
 static palette222_t palette;
 static palette_t palette16; // Colour palette
 static uint8_t manual_palette_selected = 0; // auto
+
+static constexpr uint8_t PALETTE_CUSTOM = NUMBER_OF_MANUAL_PALETTES;
+static constexpr uint8_t PALETTE_CUSTOM_PRESET = NUMBER_OF_MANUAL_PALETTES + 1;
+static constexpr uint8_t PALETTE_CUSTOM_RANDOM = NUMBER_OF_MANUAL_PALETTES + 2;
+static uint32_t custom_rgb[4] = { 0xD4FFFD, 0x139566, 0x106F4C, 0x000000 };
+static uint8_t preset_rgb_index[4] = {0, 0, 0, 10};
+static uint8_t hex_digit = 0;
+static char current_rom_name[128] = {};
+static bool game_palette_linked = false;
+static bool game_palette_active = false;
+static uint32_t game_palette_rgb[3][4] = {};
+
+// Same curated LCD colour pools as Watara. Empty spreadsheet cells are omitted.
+static const uint32_t preset_rgb0[] = {
+    0xD4FFFD, 0xD4FFF3, 0xFFE9FA, 0xE9E9FF, 0xE9FAFF, 0xE9FFF4,
+    0xF5FFE9, 0xFFF8E9, 0xFFEBE9, 0xD4FFDA, 0xEDFFD4
+};
+static const uint32_t preset_rgb1_cold[] = { 0x139566, 0x349BC0, 0x009999, 0x7296B6, 0xC0CBD5, 0xC3D5B5 };
+static const uint32_t preset_rgb1_warm[] = { 0xE8AE74, 0xC57CDA };
+static const uint32_t preset_rgb2_cold[] = { 0x106F4C, 0x1C5165, 0x006565, 0x496074 };
+static const uint32_t preset_rgb2_warm[] = { 0xF79036, 0xBD5F00, 0xD58B41, 0xD8C835, 0xE98EA8 };
+static const uint32_t preset_rgb3[] = {
+    0x6C6800, 0x6B0400, 0x366C00, 0x006C48, 0x00686C, 0x00326C,
+    0x04006C, 0x44006C, 0x6C0044, 0x6C0004, 0x000000
+};
+static constexpr uint8_t RGB1_COLD_COUNT = count_of(preset_rgb1_cold);
+static constexpr uint8_t RGB1_COUNT = count_of(preset_rgb1_cold) + count_of(preset_rgb1_warm);
+static constexpr uint8_t RGB2_COLD_COUNT = count_of(preset_rgb2_cold);
+static constexpr uint8_t RGB2_COUNT = count_of(preset_rgb2_cold) + count_of(preset_rgb2_warm);
+
+static uint32_t preset_rgb1_at(uint8_t i) { return i < RGB1_COLD_COUNT ? preset_rgb1_cold[i] : preset_rgb1_warm[i - RGB1_COLD_COUNT]; }
+static uint32_t preset_rgb2_at(uint8_t i) { return i < RGB2_COLD_COUNT ? preset_rgb2_cold[i] : preset_rgb2_warm[i - RGB2_COLD_COUNT]; }
+static uint32_t palette_random_state = 0x6D2B79F5u;
+static uint32_t palette_random_next() { uint32_t x=palette_random_state; x^=x<<13; x^=x>>17; x^=x<<5; return palette_random_state=x; }
+static void randomize_custom_palette() {
+    uint64_t t=time_us_64(); palette_random_state ^= (uint32_t)t ^ (uint32_t)(t>>32);
+    custom_rgb[0]=preset_rgb0[palette_random_next()%count_of(preset_rgb0)];
+    uint8_t i1=palette_random_next()%RGB1_COUNT; custom_rgb[1]=preset_rgb1_at(i1);
+    custom_rgb[2]=(i1<RGB1_COLD_COUNT) ? preset_rgb2_cold[palette_random_next()%count_of(preset_rgb2_cold)] : preset_rgb2_warm[palette_random_next()%count_of(preset_rgb2_warm)];
+    custom_rgb[3]=preset_rgb3[palette_random_next()%count_of(preset_rgb3)];
+}
 
 struct input_bits_t {
     bool a: true;
@@ -137,6 +188,8 @@ static bool isInReport(hid_keyboard_report_t const* report, const unsigned char 
 static volatile bool altPressed = false;
 static volatile bool ctrlPressed = false;
 static volatile uint8_t fxPressedV = 0;
+static volatile bool pageUpPressed = false;
+static volatile bool pageDownPressed = false;
 
 void
 __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
@@ -162,6 +215,10 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
 
     altPressed = isInReport(report, HID_KEY_ALT_LEFT) || isInReport(report, HID_KEY_ALT_RIGHT);
     ctrlPressed = isInReport(report, HID_KEY_CONTROL_LEFT) || isInReport(report, HID_KEY_CONTROL_RIGHT);
+    if (isInReport(report, HID_KEY_PAGE_UP) && !isInReport(prev_report, HID_KEY_PAGE_UP))
+        pageUpPressed = true;
+    if (isInReport(report, HID_KEY_PAGE_DOWN) && !isInReport(prev_report, HID_KEY_PAGE_DOWN))
+        pageDownPressed = true;
     
     if (altPressed && ctrlPressed && isInReport(report, HID_KEY_DELETE)) {
         watchdog_enable(10, true);
@@ -392,62 +449,192 @@ bool isExecutable(const char pathname[255],const char *extensions) {
     return false;
 }
 
+static void apply_dmg_palette() {
+    if (game_palette_active && manual_palette_selected == PALETTE_CUSTOM) {
+        for (int i=0;i<3;i++) for (int j=0;j<4;j++) { graphics_set_palette(i*4+j, custom_to_driver_color(game_palette_rgb[i][j])); palette[i][j]=i*4+j; }
+        return;
+    }
+    if (manual_palette_selected == PALETTE_CUSTOM || manual_palette_selected == PALETTE_CUSTOM_PRESET || manual_palette_selected == PALETTE_CUSTOM_RANDOM) {
+        for (int i=0;i<3;i++) for (int j=0;j<4;j++) { graphics_set_palette(i*4+j, custom_to_driver_color(custom_rgb[j])); palette[i][j]=i*4+j; }
+        return;
+    }
+    if (manual_palette_selected > 0) manual_assign_palette(palette16, manual_palette_selected);
+    else { char rom_title[16]; auto_assign_palette(palette16, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title)); }
+    for (int i=0;i<3;i++) for (int j=0;j<4;j++) { graphics_set_palette(i*4+j, RGB565_TO_RGB888(palette16[i][j])); palette[i][j]=i*4+j; }
+}
+
+static void game_ini_path(char *out, size_t n) {
+    char base[128]; strncpy(base,current_rom_name,sizeof(base)-1); base[sizeof(base)-1]=0;
+    char *dot=strrchr(base,'.'); if(dot)*dot=0; snprintf(out,n,"/.config/gameboy/%s.ini",base);
+}
+static bool game_palette_read() {
+    game_palette_active=false; game_palette_linked=false; if(!current_rom_name[0]) return false;
+    char path[256]; game_ini_path(path,sizeof(path)); FIL f; if(f_open(&f,path,FA_READ)!=FR_OK) return false;
+    char buf[512]={}; UINT br=0; f_read(&f,buf,sizeof(buf)-1,&br); f_close(&f); buf[br]=0;
+    unsigned long v[12]; int n=sscanf(buf,
+        "[palette]\\nbg0=%lx\\nbg1=%lx\\nbg2=%lx\\nbg3=%lx\\nobj10=%lx\\nobj11=%lx\\nobj12=%lx\\nobj13=%lx\\nobj20=%lx\\nobj21=%lx\\nobj22=%lx\\nobj23=%lx",
+        &v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],&v[8],&v[9],&v[10],&v[11]);
+    game_palette_linked=true; if(n!=12) return false;
+    for(int i=0;i<3;i++) for(int j=0;j<4;j++) game_palette_rgb[i][j]=(uint32_t)v[i*4+j]&0xFFFFFF;
+    for(int j=0;j<4;j++) custom_rgb[j]=game_palette_rgb[0][j];
+    game_palette_active=true; manual_palette_selected=PALETTE_CUSTOM; return true;
+}
+static bool game_palette_write() {
+    if(!current_rom_name[0]) return false; f_mkdir("/.config"); f_mkdir("/.config/gameboy");
+    uint32_t c[3][4];
+    if(game_palette_active && manual_palette_selected==PALETTE_CUSTOM) memcpy(c,game_palette_rgb,sizeof(c));
+    else if(manual_palette_selected>=PALETTE_CUSTOM) for(int i=0;i<3;i++) for(int j=0;j<4;j++) c[i][j]=custom_rgb[j];
+    else { palette_t p; if(manual_palette_selected) manual_assign_palette(p,manual_palette_selected); else { char t[16]; auto_assign_palette(p,gb_colour_hash(&gb),gb_get_rom_name(&gb,t)); } for(int i=0;i<3;i++) for(int j=0;j<4;j++) c[i][j]=rgb565_to_rgb888(p[i][j]); }
+    char text[384]; int len=snprintf(text,sizeof(text),"[palette]\\nbg0=%06lX\\nbg1=%06lX\\nbg2=%06lX\\nbg3=%06lX\\nobj10=%06lX\\nobj11=%06lX\\nobj12=%06lX\\nobj13=%06lX\\nobj20=%06lX\\nobj21=%06lX\\nobj22=%06lX\\nobj23=%06lX\\n",
+      (unsigned long)c[0][0],(unsigned long)c[0][1],(unsigned long)c[0][2],(unsigned long)c[0][3],(unsigned long)c[1][0],(unsigned long)c[1][1],(unsigned long)c[1][2],(unsigned long)c[1][3],(unsigned long)c[2][0],(unsigned long)c[2][1],(unsigned long)c[2][2],(unsigned long)c[2][3]);
+    char path[256]; game_ini_path(path,sizeof(path)); FIL f; if(f_open(&f,path,FA_CREATE_ALWAYS|FA_WRITE)!=FR_OK)return false; UINT bw=0; FRESULT r=f_write(&f,text,len,&bw); FRESULT rc=f_close(&f); return r==FR_OK&&rc==FR_OK&&bw==(UINT)len;
+}
+static bool game_palette_unlink() { char p[256]; game_ini_path(p,sizeof(p)); FRESULT r=f_unlink(p); game_palette_active=false; return r==FR_OK||r==FR_NO_FILE; }
+
+static bool demo_requested = false;
+static bool demo_active = false;
+static bool demo_advance_pending = false;
+static uint64_t demo_game_started_at = 0;
+static char demo_current_name[128] = {};
+static const uint16_t demo_seconds[] = { 15, 30, 45, 60, 120, 180, 300, 600 };
+static uint8_t demo_duration = 0;
+
 bool __not_in_flash_func(filebrowser_loadfile)(const char pathname[256]) {
     UINT bytes_read = 0;
     FIL file;
 
     constexpr int window_y = (TEXTMODE_ROWS - 5) / 2;
     constexpr int window_x = (TEXTMODE_COLS - 43) / 2;
+    const auto show_load_error = [&](const char *message) {
+        draw_text(message, window_x + 1, window_y + 2, 13, 1);
+        sleep_ms(demo_active ? 1500 : 5000);
+    };
 
-    draw_window("Loading firmware", window_x, window_y, 43, 5);
+    draw_window("Loading ROM", window_x, window_y, 43, 5);
 
-    FILINFO fileinfo;
-    f_stat(pathname, &fileinfo);
-
-    if (16384 - 64 << 10 < fileinfo.fsize) {
-        draw_text("ERROR: ROM too large! Canceled!!", window_x + 1, window_y + 2, 13, 1);
-        sleep_ms(5000);
+    /* Open the browser-selected path first; the original loader did not
+       depend on a separate f_stat() path lookup. */
+    if (FR_OK != f_open(&file, pathname, FA_READ)) {
+        show_load_error("ERROR: ROM open failed!");
         return false;
     }
 
+    const uint32_t load_size = f_size(&file);
+    if (load_size == 0) {
+        f_close(&file);
+        show_load_error("ERROR: ROM is empty!");
+        return false;
+    }
+
+    const uint32_t flash_capacity = PICO_FLASH_SIZE_BYTES - FLASH_TARGET_OFFSET;
+    if (load_size > flash_capacity) {
+        f_close(&file);
+        show_load_error("ERROR: ROM too large! Canceled!!");
+        return false;
+    }
 
     draw_text("Loading...", window_x + 1, window_y + 2, 10, 1);
-    sleep_ms(500);
 
-
+    uint32_t total_read = 0;
+    bool flash_verify_failed = false;
+    FRESULT read_result = FR_OK;
     multicore_lockout_start_blocking();
-    auto flash_target_offset = FLASH_TARGET_OFFSET;
-    const uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(flash_target_offset, fileinfo.fsize);
-    restore_interrupts(ints);
+    uint32_t flash_target_offset = FLASH_TARGET_OFFSET;
+    static uint8_t buffer[FLASH_SECTOR_SIZE] __aligned(4);
 
-    if (FR_OK == f_open(&file, pathname, FA_READ)) {
-        uint8_t buffer[FLASH_PAGE_SIZE];
+    do {
+        memset(buffer, 0xff, sizeof(buffer));
+        read_result = f_read(&file, buffer, sizeof(buffer), &bytes_read);
+        total_read += bytes_read;
 
-        do {
-            f_read(&file, &buffer, FLASH_PAGE_SIZE, &bytes_read);
-
-            if (bytes_read) {
+        if (read_result == FR_OK && bytes_read) {
+            const uint8_t *flash_data = (const uint8_t *)(XIP_BASE + flash_target_offset);
+            if (memcmp(flash_data, buffer, sizeof(buffer)) != 0) {
                 const uint32_t ints = save_and_disable_interrupts();
-                flash_range_program(flash_target_offset, buffer, FLASH_PAGE_SIZE);
+                flash_range_erase(flash_target_offset, FLASH_SECTOR_SIZE);
+                flash_range_program(flash_target_offset, buffer, FLASH_SECTOR_SIZE);
                 restore_interrupts(ints);
 
-                gpio_put(PICO_DEFAULT_LED_PIN, flash_target_offset >> 13 & 1);
-
-                flash_target_offset += FLASH_PAGE_SIZE;
+                if (memcmp(flash_data, buffer, sizeof(buffer)) != 0) {
+                    flash_verify_failed = true;
+                    break;
+                }
             }
-        }
-        while (bytes_read != 0);
 
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
-    }
-    f_close(&file);
+            gpio_put(PICO_DEFAULT_LED_PIN, (flash_target_offset >> 13) & 1);
+            flash_target_offset += FLASH_SECTOR_SIZE;
+        }
+    } while (read_result == FR_OK && bytes_read != 0);
+
+    gpio_put(PICO_DEFAULT_LED_PIN, true);
     multicore_lockout_end_blocking();
-    // restore_interrupts(ints);
+    FRESULT close_result = f_close(&file);
+
+    if (flash_verify_failed) {
+        show_load_error("ERROR: Flash verify failed!");
+        return false;
+    }
+    if (read_result != FR_OK || close_result != FR_OK || total_read != load_size) {
+        show_load_error("ERROR: ROM load failed!");
+        return false;
+    }
+
+    const char *bn = strrchr(pathname, '\\');
+    if (!bn) bn = strrchr(pathname, '/');
+    bn = bn ? bn + 1 : pathname;
+    strncpy(current_rom_name, bn, sizeof(current_rom_name) - 1);
+    current_rom_name[sizeof(current_rom_name) - 1] = 0;
+    game_palette_linked = false;
+    game_palette_active = false;
     return true;
 }
 
-void __not_in_flash_func(filebrowser)(const char pathname[256], const char executables[11]) {
+static bool demo_load_next_rom(const char *after_name) {
+    char after[128] = {};
+    if (after_name && after_name[0]) {
+        strncpy(after, after_name, sizeof(after) - 1);
+    }
+
+    /* Walk the root ROM directory in lexical order. Failed ROMs are skipped. */
+    for (;;) {
+        DIR dir;
+        FILINFO info;
+        if (FR_OK != f_opendir(&dir, HOME_DIR))
+            return false;
+
+        char best[128] = {};
+        while (f_readdir(&dir, &info) == FR_OK && info.fname[0]) {
+            if (info.fattrib & AM_DIR)
+                continue;
+            if (!isExecutable(info.fname, "gbc,gb"))
+                continue;
+            if (after[0] && strcmp(info.fname, after) <= 0)
+                continue;
+            if (!best[0] || strcmp(info.fname, best) < 0) {
+                strncpy(best, info.fname, sizeof(best) - 1);
+            }
+        }
+        f_closedir(&dir);
+
+        if (!best[0])
+            return false;
+
+        char pathname[256];
+        snprintf(pathname, sizeof(pathname), "%s\\%s", HOME_DIR, best);
+        if (!filebrowser_loadfile(pathname)) {
+            strncpy(after, best, sizeof(after) - 1);
+            continue;
+        }
+
+        strncpy(demo_current_name, best, sizeof(demo_current_name) - 1);
+        demo_current_name[sizeof(demo_current_name) - 1] = 0;
+        demo_game_started_at = time_us_64();
+        return true;
+    }
+}
+
+bool __not_in_flash_func(filebrowser)(const char pathname[256], const char executables[11]) {
+    bool demo_debounce = false;
     bool debounce = true;
     char basepath[256];
     char tmp[TEXTMODE_COLS + 1];
@@ -483,7 +670,11 @@ void __not_in_flash_func(filebrowser)(const char pathname[256], const char execu
         off += 16;
         draw_text("A/F10", off, 29, 7, 0);
         off += 5;
-        draw_text(" USB DRV ", off, 29, 0, 3);
+        draw_text(" USB ", off, 29, 0, 3);
+        off += 5;
+        draw_text("B", off, 29, 7, 0);
+        off += 1;
+        draw_text(" Demo", off, 29, 0, 3);
 #endif
 
         if (FR_OK != f_opendir(&dir, basepath)) {
@@ -527,9 +718,16 @@ void __not_in_flash_func(filebrowser)(const char pathname[256], const char execu
                 debounce = !(gamepad_bits.start);
             }
 
+            if (!gamepad_bits.b)
+                demo_debounce = true;
+            if (demo_debounce && gamepad_bits.b) {
+                demo_requested = true;
+                return false;
+            }
+
             // ESCAPE
             if (gamepad_bits.select) {
-                return;
+                return false;
             }
 
             if (gamepad_bits.down) {
@@ -569,6 +767,22 @@ void __not_in_flash_func(filebrowser)(const char pathname[256], const char execu
                 }
             }
 
+            constexpr int half_page = per_page / 2;
+            if (pageDownPressed && total_files > 0) {
+                pageDownPressed = false;
+                int selected = offset + current_item + half_page;
+                if (selected >= total_files) selected = total_files - 1;
+                if (selected < offset + per_page) current_item = selected - offset;
+                else { current_item = per_page - 1; offset = selected - current_item; }
+            }
+            if (pageUpPressed && total_files > 0) {
+                pageUpPressed = false;
+                int selected = offset + current_item - half_page;
+                if (selected < 0) selected = 0;
+                if (selected >= offset) current_item = selected - offset;
+                else { current_item = 0; offset = selected; }
+            }
+
             if (debounce && gamepad_bits.start) {
                 auto file_at_cursor = fileItems[offset + current_item];
 
@@ -590,8 +804,9 @@ void __not_in_flash_func(filebrowser)(const char pathname[256], const char execu
                 if (file_at_cursor.is_executable) {
                     sprintf(tmp, "%s\\%s", basepath, file_at_cursor.filename);
 
-                    filebrowser_loadfile(tmp);
-                    return;
+                    if (filebrowser_loadfile(tmp))
+                        return true;
+                    debounce = false;
                 }
             }
 
@@ -641,9 +856,12 @@ enum menu_type_e {
     INT,
     TEXT,
     ARRAY,
+    HEX,
+    GAME_PALETTE_LINK,
 
     SAVE,
     LOAD,
+    START_DEMO,
     ROM_SELECT,
     RETURN,
 };
@@ -656,7 +874,7 @@ typedef struct __attribute__((__packed__)) {
     const void* value;
     menu_callback_t callback;
     uint8_t max_value;
-    char value_list[15][15];
+    char value_list[16][20];
 } MenuItem;
 
 static int save_slot = 0;
@@ -751,23 +969,16 @@ const MenuItem menu_items[] = {
     //{ "Player 1: %s",        ARRAY, &player_1_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
     //{ "Player 2: %s",        ARRAY, &player_2_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
     { "Swap AB <> BA: %s", ARRAY, &swap_ab,  nullptr, 1, {"NO ", "YES"}},
-    { "Palette: %s ", ARRAY, &manual_palette_selected, nullptr, 12,
-        {
-            "0 - AUTO      ",
-            "1 - yellow-red",
-            "2 - orange    ",
-            "3 - negative  ",
-            "4 - dark green",
-            "5 - red       ",
-            "6 - pink      ",
-            "7 - green     ",
-            "8 - dark blue ",
-            "9 - pastel    ",
-            "10 - blue     ",
-            "11 - yellow   ",
-            "12 - DMG      "
-        }
-    },
+    { "Palette: %s ", ARRAY, &manual_palette_selected, nullptr, PALETTE_CUSTOM_RANDOM,
+        { "0 - AUTO      ", "1 - yellow-red", "2 - orange    ", "3 - negative  ", "4 - dark green", "5 - red       ", "6 - pink      ", "7 - green     ", "8 - dark blue ", "9 - pastel    ", "10 - blue     ", "11 - yellow   ", "12 - DMG      ", "CUSTOM        ", "CUSTOM PRESET ", "CUSTOM RANDOM " } },
+    { "Save for this game", GAME_PALETTE_LINK },
+    { "RGB0: %06lXh", HEX, &custom_rgb[0], nullptr, 0 },
+    { "RGB1: %06lXh", HEX, &custom_rgb[1], nullptr, 0 },
+    { "RGB2: %06lXh", HEX, &custom_rgb[2], nullptr, 0 },
+    { "RGB3: %06lXh", HEX, &custom_rgb[3], nullptr, 0 },
+    { "Demo game time: %s", ARRAY, &demo_duration, nullptr, 7,
+        { "15 sec", "30 sec", "45 sec", "1 min ", "2 min ", "3 min ", "5 min ", "10 min" } },
+    { "Start Demo", START_DEMO },
     {},
     { "Save state: %i", INT, &save_slot, &save, 8 },
     { "Load state: %i", INT, &save_slot, &load, 8 },
@@ -791,24 +1002,37 @@ const MenuItem menu_items[] = {
 };
 #define MENU_ITEMS_NUMBER (sizeof(menu_items) / sizeof (MenuItem))
 
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t version, swap_ab, palette, preset[4], color_mode, demo_duration;
+    uint32_t rgb[4];
+} gb_settings_t;
+static constexpr uint32_t GB_CONF_MAGIC=0x47424346; static constexpr uint8_t GB_CONF_VERSION=2;
 static void f_load_conf(void) {
-    FIL f;
-    if (f_open(&f, "/GB/gb.conf", FA_READ) == FR_OK) {
-        UINT br;
-        f_read(&f, &swap_ab, 1, &br);
-        f_read(&f, &manual_palette_selected, 1, &br);
-        f_close(&f);
+    FIL f; bool loaded=false;
+    if(f_open(&f,"/.config/gameboy/gameboy.conf",FA_READ)==FR_OK) {
+        gb_settings_t c{}; UINT br=0; f_read(&f,&c,sizeof(c),&br); f_close(&f);
+        if(br==sizeof(c)&&c.magic==GB_CONF_MAGIC&&c.version==GB_CONF_VERSION) {
+            swap_ab=c.swap_ab; manual_palette_selected=c.palette<=PALETTE_CUSTOM_RANDOM?c.palette:0;
+            memcpy(preset_rgb_index,c.preset,4); memcpy(custom_rgb,c.rgb,sizeof(custom_rgb));
+#if SOFTTV
+            color_mode=c.color_mode;
+#endif
+            demo_duration = c.demo_duration < count_of(demo_seconds) ? c.demo_duration : 0;
+            preset_rgb_index[0]%=count_of(preset_rgb0); preset_rgb_index[1]%=RGB1_COUNT; preset_rgb_index[2]%=RGB2_COUNT; preset_rgb_index[3]%=count_of(preset_rgb3); loaded=true;
+        }
     }
+    if(!loaded && f_open(&f,"/GB/gb.conf",FA_READ)==FR_OK) { UINT br=0; f_read(&f,&swap_ab,1,&br); f_read(&f,&manual_palette_selected,1,&br); f_close(&f); if(manual_palette_selected>=NUMBER_OF_MANUAL_PALETTES) manual_palette_selected=0; }
 }
-
 static void f_save_conf(void) {
-    f_mkdir("/GB"); // ничего не делает, если она уже есть
-    FIL f;
-    f_open(&f, "/GB/gb.conf", FA_CREATE_ALWAYS | FA_WRITE);
-    UINT br;
-    f_write(&f, &swap_ab, 1, &br);
-    f_write(&f, &manual_palette_selected, 1, &br);
-    f_close(&f);
+    f_mkdir("/.config"); f_mkdir("/.config/gameboy"); gb_settings_t c{}; c.magic=GB_CONF_MAGIC; c.version=GB_CONF_VERSION; c.swap_ab=swap_ab; c.palette=manual_palette_selected; c.demo_duration=demo_duration;
+    memcpy(c.preset,preset_rgb_index,4); memcpy(c.rgb,custom_rgb,sizeof(custom_rgb));
+#if SOFTTV
+    c.color_mode=color_mode;
+#else
+    c.color_mode=1;
+#endif
+    FIL f; if(f_open(&f,"/.config/gameboy/gameboy.conf",FA_CREATE_ALWAYS|FA_WRITE)==FR_OK){UINT bw=0; f_write(&f,&c,sizeof(c),&bw); f_close(&f);}
 }
 
 void menu() {
@@ -821,6 +1045,8 @@ void menu() {
              __TIME__);
     draw_text(footer, TEXTMODE_COLS / 2 - strlen(footer) / 2, TEXTMODE_ROWS - 1, 11, 1);
     uint current_item = 0;
+    uint8_t previous_palette = manual_palette_selected;
+    bool hex_editing = false;
 
     while (!exit) {
         for (int i = 0; i < MENU_ITEMS_NUMBER; i++) {
@@ -835,6 +1061,25 @@ void menu() {
             const MenuItem* item = &menu_items[i];
             if (i == current_item) {
                 switch (item->type) {
+                    case HEX: {
+                        int pidx=(int)((uint32_t*)item->value-custom_rgb);
+                        if(manual_palette_selected==PALETTE_CUSTOM_PRESET) {
+                            uint8_t maxv=pidx==0?count_of(preset_rgb0):pidx==1?RGB1_COUNT:pidx==2?RGB2_COUNT:count_of(preset_rgb3);
+                            if(gamepad_bits.right) preset_rgb_index[pidx]=(preset_rgb_index[pidx]+1)%maxv;
+                            if(gamepad_bits.left) preset_rgb_index[pidx]=(preset_rgb_index[pidx]+maxv-1)%maxv;
+                            custom_rgb[0]=preset_rgb0[preset_rgb_index[0]]; custom_rgb[1]=preset_rgb1_at(preset_rgb_index[1]); custom_rgb[2]=preset_rgb2_at(preset_rgb_index[2]); custom_rgb[3]=preset_rgb3[preset_rgb_index[3]];
+                            game_palette_active=false;
+                        } else if(manual_palette_selected==PALETTE_CUSTOM) {
+                            if(gamepad_bits.start) hex_editing=!hex_editing;
+                            if(hex_editing) {
+                                uint32_t step=1u<<((5-hex_digit)*4); if(gamepad_bits.up) custom_rgb[pidx]=(custom_rgb[pidx]+step)&0xFFFFFF; if(gamepad_bits.down) custom_rgb[pidx]=(custom_rgb[pidx]-step)&0xFFFFFF;
+                                if(gamepad_bits.right) hex_digit=(hex_digit+1)%6; if(gamepad_bits.left) hex_digit=(hex_digit+5)%6; game_palette_active=false;
+                            }
+                        }
+                        apply_dmg_palette(); break; }
+                    case GAME_PALETTE_LINK:
+                        if(gamepad_bits.start&&current_rom_name[0]) { if(game_palette_linked){if(game_palette_unlink())game_palette_linked=false;} else if(game_palette_write())game_palette_linked=true; }
+                        break;
                     case INT:
                     case ARRAY:
                         if (item->max_value != 0) {
@@ -852,8 +1097,19 @@ void menu() {
                             exit = true;
                         break;
 
+                    case START_DEMO:
+                        if (gamepad_bits.start) {
+                            demo_requested = true;
+                            restart = true;
+                            exit = true;
+                        }
+                        break;
+
                     case ROM_SELECT:
                         if (gamepad_bits.start) {
+                            demo_active = false;
+                            demo_requested = false;
+                            demo_advance_pending = false;
                             restart = true;
                             return;
                         }
@@ -866,8 +1122,22 @@ void menu() {
                     exit = item->callback();
                 }
             }
+            if(previous_palette!=manual_palette_selected) {
+                hex_editing=false; game_palette_active=false;
+                if(manual_palette_selected==PALETTE_CUSTOM_PRESET) { custom_rgb[0]=preset_rgb0[preset_rgb_index[0]]; custom_rgb[1]=preset_rgb1_at(preset_rgb_index[1]); custom_rgb[2]=preset_rgb2_at(preset_rgb_index[2]); custom_rgb[3]=preset_rgb3[preset_rgb_index[3]]; }
+                if(manual_palette_selected==PALETTE_CUSTOM_RANDOM) randomize_custom_palette();
+                apply_dmg_palette(); previous_palette=manual_palette_selected;
+            }
             static char result[TEXTMODE_COLS];
             switch (item->type) {
+                case HEX: {
+                    int pidx=(int)((uint32_t*)item->value-custom_rgb);
+                    if(manual_palette_selected==PALETTE_CUSTOM_PRESET) snprintf(result,TEXTMODE_COLS,"RGB%d: <%06lXh> %u",pidx,(unsigned long)custom_rgb[pidx],preset_rgb_index[pidx]+1);
+                    else if(manual_palette_selected==PALETTE_CUSTOM_RANDOM) snprintf(result,TEXTMODE_COLS,"RGB%d: %06lXh RANDOM",pidx,(unsigned long)custom_rgb[pidx]);
+                    else snprintf(result,TEXTMODE_COLS,item->text,(unsigned long)custom_rgb[pidx]);
+                    break; }
+                case GAME_PALETTE_LINK:
+                    snprintf(result,TEXTMODE_COLS,"%s",!current_rom_name[0]?"Save for this game [N/A]":game_palette_linked?"Unlink game ini file":"Save for this game"); break;
                 case INT:
                     snprintf(result, TEXTMODE_COLS, item->text, *(uint8_t *)item->value);
                     break;
@@ -883,15 +1153,17 @@ void menu() {
                     snprintf(result, TEXTMODE_COLS, "%s", item->text);
             }
             draw_text(result, x, y, color, bg_color);
+            if(item->type==ARRAY && item->value==&manual_palette_selected) for(uint8_t q=0;q<4;q++) draw_palette_preview(TEXTMODE_COLS-8+q*2,y,q,2);
+            else if(item->type==HEX) draw_palette_preview(TEXTMODE_COLS-3,y,(uint8_t)((uint32_t*)item->value-custom_rgb),3);
         }
 
-        if (gamepad_bits.down) {
+        if (gamepad_bits.down && !hex_editing) {
             current_item = (current_item + 1) % MENU_ITEMS_NUMBER;
 
             if (menu_items[current_item].type == NONE)
                 current_item++;
         }
-        if (gamepad_bits.up) {
+        if (gamepad_bits.up && !hex_editing) {
             current_item = (current_item - 1 + MENU_ITEMS_NUMBER) % MENU_ITEMS_NUMBER;
 
             if (menu_items[current_item].type == NONE)
@@ -900,17 +1172,7 @@ void menu() {
 
         sleep_ms(125);
     }
-    if (manual_palette_selected > 0) {
-        manual_assign_palette(palette16, manual_palette_selected);
-    } else {
-        char rom_title[16];
-        auto_assign_palette(palette16, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title));
-    }
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 4; j++) {
-            graphics_set_palette(i * 4 + j, RGB565_TO_RGB888(palette16[i][j]));
-            palette[i][j] = i * 4 + j;
-        }
+    apply_dmg_palette();
     f_save_conf();
     graphics_set_mode(GRAPHICSMODE_DEFAULT);
 }
@@ -954,12 +1216,34 @@ int main() {
         f_load_conf();
     }
 
+    bool need_browser = true;
+    bool rom_loaded = false;
     while (true) {
-        /* ROM File selector */
-        if (FR_OK == fr) {
+        if (need_browser && FR_OK == fr) {
             graphics_set_mode(TEXTMODE_DEFAULT);
-            filebrowser(HOME_DIR, "gbc,gb");
+            demo_active = false;
+            demo_advance_pending = false;
+            const bool rom_selected = filebrowser(HOME_DIR, "gbc,gb");
+
+            if (demo_requested) {
+                demo_requested = false;
+                demo_active = true;
+                demo_current_name[0] = 0;
+                if (!demo_load_next_rom(nullptr)) {
+                    demo_active = false;
+                    continue;
+                }
+                rom_loaded = true;
+            } else {
+                rom_loaded = rom_selected;
+            }
             graphics_set_mode(GRAPHICSMODE_DEFAULT);
+            need_browser = false;
+        }
+
+        if (!rom_loaded) {
+            need_browser = true;
+            continue;
         }
 
         /* Initialise GB context. */
@@ -967,25 +1251,25 @@ int main() {
                                       &gb_cart_ram_write, &gb_error, nullptr);
 
         if (ret != GB_INIT_NO_ERROR) {
-            while (1) draw_text("error", 1, 1, 1, 2);
-        }
-
-        /* Automatically assign a colour palette to the game */
-        if (!manual_palette_selected) {
-            char rom_title[16];
-            auto_assign_palette(palette16, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title));
-        }
-        else {
-            manual_assign_palette(palette16, manual_palette_selected);
-        }
-
-        if (!gb.cgb.cgbMode)
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 4; j++) {
-                    graphics_set_palette(i * 4 + j, RGB565_TO_RGB888(palette16[i][j]));
-                    palette[i][j] = i * 4 + j;
+            graphics_set_mode(TEXTMODE_DEFAULT);
+            draw_text("ERROR: invalid Game Boy ROM", 1, 1, 13, 1);
+            sleep_ms(demo_active ? 1500 : 5000);
+            if (demo_active) {
+                if (demo_load_next_rom(demo_current_name)) {
+                    rom_loaded = true;
+                    continue;
                 }
-        //palette[i][j] = convertRGB565toRGB222(palette16[i][j]);
+                demo_active = false;
+            }
+            rom_loaded = false;
+            need_browser = true;
+            continue;
+        }
+
+        /* Assign palette; per-game INI overrides it except in RANDOM mode. */
+        if (manual_palette_selected == PALETTE_CUSTOM_RANDOM) { game_palette_linked = game_palette_read(); manual_palette_selected = PALETTE_CUSTOM_RANDOM; game_palette_active = false; randomize_custom_palette(); }
+        else game_palette_read();
+        if (!gb.cgb.cgbMode) apply_dmg_palette();
 
         gb_init_lcd(&gb, &lcd_draw_line);
         /* Load Save File. */
@@ -1055,6 +1339,14 @@ int main() {
             //-----------------------------------------------------------------
             gb_run_frame(&gb);
 
+            if (demo_active) {
+                const uint8_t di = demo_duration < count_of(demo_seconds) ? demo_duration : 0;
+                if (time_us_64() - demo_game_started_at >= (uint64_t)demo_seconds[di] * 1000000ull) {
+                    demo_advance_pending = true;
+                    restart = true;
+                }
+            }
+
             //gb.direct.interlace = 1;
 
             if (!gb.direct.frame_skip) {
@@ -1062,6 +1354,31 @@ int main() {
                 i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
             }
         }
+        write_cart_ram_file(&gb);
         restart = false;
+        rom_loaded = false;
+
+        if (demo_requested) {
+            demo_requested = false;
+            demo_active = true;
+            demo_current_name[0] = 0;
+            if (demo_load_next_rom(nullptr)) {
+                rom_loaded = true;
+                continue;
+            }
+            demo_active = false;
+        } else if (demo_active && demo_advance_pending) {
+            demo_advance_pending = false;
+            if (demo_load_next_rom(demo_current_name)) {
+                rom_loaded = true;
+                continue;
+            }
+            demo_active = false;
+        }
+
+        demo_active = false;
+        demo_requested = false;
+        demo_advance_pending = false;
+        need_browser = true;
     }
 }

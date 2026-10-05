@@ -997,12 +997,12 @@ static bool __time_critical_func(video_timer_callbackTV)(repeating_timer_t* rt) 
                                 const uint8_t c = text_buffer[offset];
                                 const uint8_t colorIndex = text_buffer[offset + 1];
                                 uint8_t glyph_row = font_6x8[c * 8 + y % 8];
+                                const bool preview = c == 0 && colorIndex >= 0xF0 && colorIndex <= 0xF3;
 
                                 for (int bit = 6; bit--;) {
-                                    uint32_t cout32 = conv_color[li][glyph_row & 1
+                                    uint32_t cout32 = conv_color[li][preview ? (colorIndex & 3) : (glyph_row & 1
                                                                          ? textmode_palette[colorIndex & 0xf]
-                                                                         //цвет шрифта
-                                                                         : textmode_palette[colorIndex >> 4] //цвет фона
+                                                                         : textmode_palette[colorIndex >> 4])
                                     ];
                                     uint8_t* c_4 = (uint8_t*)&cout32;
                                     *output_buffer8++ = c_4[bit % 4];

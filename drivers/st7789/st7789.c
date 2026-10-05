@@ -234,6 +234,7 @@ void __inline __scratch_y("refresh_lcd") refresh_lcd() {
                     const uint16_t offset = (y / 8) * (TEXTMODE_COLS * 2) + x * 2;
                     const uint8_t c = text_buffer[offset];
                     const uint8_t colorIndex = text_buffer[offset + 1];
+                    if (c == 0 && colorIndex >= 0xF0 && colorIndex <= 0xF3) { for(uint8_t bit=0;bit<6;bit++) st7789_lcd_put_pixel(pio,sm,palette[colorIndex&3]); continue; }
                     const uint8_t glyph_row = font_6x8[c * 8 + y % 8];
 
                     for (uint8_t bit = 0; bit < 6; bit++) {

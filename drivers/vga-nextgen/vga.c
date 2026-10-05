@@ -139,9 +139,12 @@ void __time_critical_func() dma_handler_VGA() {
 
             for (int x = 0; x < text_buffer_width; x++) {
                 //из таблицы символов получаем "срез" текущего символа
-                uint8_t glyph_pixels = font_8x16[*text_buffer_line++ * font_height + glyph_line];
+                const uint8_t c = *text_buffer_line++;
+                const uint8_t attr = *text_buffer_line++;
+                if(c==0 && attr>=0xF0 && attr<=0xF3) { uint16_t pc=palette[0][attr&3]; for(int n=0;n<4;n++){*output_buffer_16bit++=pc;if(text_buffer_width==40)*output_buffer_16bit++=pc;} continue; }
+                uint8_t glyph_pixels = font_8x16[c * font_height + glyph_line];
                 //считываем из быстрой палитры начало таблицы быстрого преобразования 2-битных комбинаций цветов пикселей
-                uint16_t* color = &txt_palette_fast[*text_buffer_line++ * 4];
+                uint16_t* color = &txt_palette_fast[attr * 4];
 #if 0
                 if (cursor_blink_state && !manager_started &&
                     (screen_line / 16 == CURSOR_Y && x == CURSOR_X && glyph_line >= 11 && glyph_line <= 13)) {

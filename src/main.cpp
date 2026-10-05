@@ -31,6 +31,9 @@
 #include <hardware/flash.h>
 #include <hardware/timer.h>
 #include <hardware/vreg.h>
+#if PICO_RP2350
+#include <hardware/structs/qmi.h>
+#endif
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
 #include <pico/multicore.h>
@@ -226,6 +229,9 @@ void gb_error(struct gb_s* gb, const enum gb_error_e gb_err, const uint16_t addr
 /* Renderer loop on Pico's second core */
 void __time_critical_func(render_core)() {
     multicore_lockout_victim_init();
+#ifdef KBDUSB
+    tuh_init(BOARD_TUH_RHPORT);
+#endif
     graphics_init();
 
     const auto buffer = (uint8_t *)SCREEN;
@@ -268,8 +274,9 @@ void __time_critical_func(render_core)() {
         tick = time_us_64();
 
 
-        // tuh_task();
-        //hid_app_task();
+#ifdef KBDUSB
+        tuh_task();
+#endif
         tight_loop_contents();
     }
 
@@ -404,7 +411,13 @@ bool __not_in_flash_func(filebrowser_loadfile)(const char pathname[256]) {
     FILINFO fileinfo;
     f_stat(pathname, &fileinfo);
 
+#ifdef PICO_PC
+    /* The ROM goes right after the firmware; the top 512 KB of the 4 MB flash
+     * stay untouched (pico-launcher lives in the last 260 KB). */
+    if (FLASH_TARGET_OFFSET + fileinfo.fsize > PICO_FLASH_SIZE_BYTES - (512u << 10)) {
+#else
     if (16384 - 64 << 10 < fileinfo.fsize) {
+#endif
         draw_text("ERROR: ROM too large! Canceled!!", window_x + 1, window_y + 2, 13, 1);
         sleep_ms(5000);
         return false;
@@ -417,8 +430,24 @@ bool __not_in_flash_func(filebrowser_loadfile)(const char pathname[256]) {
 
     multicore_lockout_start_blocking();
     auto flash_target_offset = FLASH_TARGET_OFFSET;
+#if PICO_RP2350
+    /* flash_range_erase/program leave XIP through the boot-time XIP setup,
+     * which restores the QMI window-0 timing chosen for the boot clock.
+     * overclock() runs the flash with its own timing at 378+ MHz, so the
+     * boot value would clock the flash far too fast afterwards and every
+     * XIP fetch would return garbage. Keep the overclock timing. */
+    const uint32_t qmi_timing = qmi_hw->m[0].timing;
+    const uint32_t qmi_rfmt   = qmi_hw->m[0].rfmt;
+    const uint32_t qmi_rcmd   = qmi_hw->m[0].rcmd;
+#define RESTORE_QMI() do { qmi_hw->m[0].timing = qmi_timing; qmi_hw->m[0].rfmt = qmi_rfmt; \
+                           qmi_hw->m[0].rcmd = qmi_rcmd; __asm volatile ("dsb; isb" ::: "memory"); } while (0)
+#else
+#define RESTORE_QMI() do { } while (0)
+#endif
     const uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(flash_target_offset, fileinfo.fsize);
+    /* erase whole sectors: the ROM size is rarely a multiple of 4 KB */
+    flash_range_erase(flash_target_offset, (fileinfo.fsize + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1));
+    RESTORE_QMI();
     restore_interrupts(ints);
 
     if (FR_OK == f_open(&file, pathname, FA_READ)) {
@@ -430,6 +459,7 @@ bool __not_in_flash_func(filebrowser_loadfile)(const char pathname[256]) {
             if (bytes_read) {
                 const uint32_t ints = save_and_disable_interrupts();
                 flash_range_program(flash_target_offset, buffer, FLASH_PAGE_SIZE);
+                RESTORE_QMI();
                 restore_interrupts(ints);
 
                 gpio_put(PICO_DEFAULT_LED_PIN, flash_target_offset >> 13 & 1);

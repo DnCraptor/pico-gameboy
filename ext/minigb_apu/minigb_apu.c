@@ -377,6 +377,92 @@ void audio_callback(void *userdata, int16_t *stream, size_t len)
 	update_noise(stream);
 }
 
+#ifdef HWAY
+#include "hway/ay_hway.h"
+
+/* Game Boy -> AY-3-8910 pair, by the channel state once a frame (the
+ * envelopes step at 64 Hz, the sweep at 128 Hz, so it is heard almost as is):
+ *   CH1, CH2 (squares)  -> AY 0, tones A and B (the duty cycle is lost: 50%)
+ *   CH3 (wave)          -> AY 0, tone C (a square of the wave's pitch)
+ *   CH4 (noise)         -> AY 1, noise on channel A (the 7-bit mode is lost)
+ * The AY period of a Game Boy one: f = 131072 / (2048 - x) for a square,
+ * 65536 / (2048 - x) for the wave; AY: f = clock / (16 N). */
+static uint8_t hway_shadow[2][16];
+static bool hway_shadow_valid;
+
+static void hway_set(const unsigned chip, const uint8_t reg, const uint8_t value)
+{
+	if (hway_shadow_valid && hway_shadow[chip][reg] == value)
+		return;
+	hway_shadow[chip][reg] = value;
+	hway_write_register(chip, reg, value);
+}
+
+/* the Game Boy volume is linear, the AY one ~3 dB a step */
+static const uint8_t hway_level[16] = {
+	0, 7, 9, 10, 11, 12, 12, 13, 13, 14, 14, 14, 14, 15, 15, 15
+};
+
+static uint8_t hway_volume(const struct chan *c, unsigned linear)
+{
+	if (!c->powered || !c->enabled || c->muted || !(c->on_left || c->on_right))
+		return 0;
+	/* NR50: the louder side, 0..7 -> 1/8..8/8 */
+	linear = linear * ((unsigned)MAX(vol_l, vol_r) + 1) / 8;
+	return hway_level[linear > 15 ? 15 : linear];
+}
+
+static void hway_tone(const unsigned chip, const unsigned ay_chan, uint32_t gb_period, const unsigned mult)
+{
+	/* N = clock * mult * (2048 - x) / 2097152, rounded */
+	uint32_t n = (uint32_t)(((uint64_t)HWAY_AY_CLOCK * mult * gb_period + 1048576u) / 2097152u);
+	if (n < 1) n = 1;
+	if (n > 4095) n = 4095;
+	hway_set(chip, (uint8_t)(ay_chan * 2), (uint8_t)n);
+	hway_set(chip, (uint8_t)(ay_chan * 2 + 1), (uint8_t)(n >> 8));
+}
+
+void audio_hway_update(void)
+{
+	static const uint8_t lfsr_div_lut[] = { 8, 16, 32, 48, 64, 80, 96, 112 };
+
+	hway_heartbeat();
+	if (hway_take_silenced())
+		hway_shadow_valid = false; /* core 1 zeroed the volumes: all again */
+
+	/* AY 0: three tones, no noise; AY 1: the noise on channel A only */
+	hway_set(0, 7, 0x38);
+	hway_set(1, 7, 0xb7);
+
+	for (unsigned i = 0; i < 2; i++) {
+		const struct chan *c = chans + i;
+		hway_tone(0, i, 2048u - (c->freq & 0x7ff), 1);
+		hway_set(0, (uint8_t)(8 + i), hway_volume(c, c->volume));
+	}
+
+	{
+		const struct chan *c = chans + 2;
+		static const uint8_t wave_linear[4] = { 0, 15, 8, 4 }; /* NR32: 0, 100, 50, 25% */
+		hway_tone(0, 2, 2048u - (c->freq & 0x7ff), 2);
+		hway_set(0, 10, hway_volume(c, wave_linear[c->volume & 3]));
+	}
+
+	{
+		const struct chan *c = chans + 3;
+		/* the LFSR clocks 4194304 / (div << s) times a second, the AY noise
+		 * clock / (16 NP) */
+		const uint32_t div = (uint32_t)lfsr_div_lut[c->noise.lfsr_div & 7] << (c->freq & 15);
+		uint32_t np = (uint32_t)(((uint64_t)HWAY_AY_CLOCK * div + 33554432u) / 67108864u);
+		if (np < 1) np = 1;
+		if (np > 31) np = 31;
+		hway_set(1, 6, (uint8_t)np);
+		hway_set(1, 8, hway_volume(c, c->volume));
+	}
+
+	hway_shadow_valid = true;
+}
+#endif
+
 static void chan_trigger(uint_fast8_t i)
 {
 	struct chan *c = chans + i;

@@ -45,6 +45,9 @@
 
 #include "audio.h"
 #include "minigb_apu.h"
+#if HWAY
+#include "hway/ay_hway.h"
+#endif
 
 /* Project headers */
 #include "hedley.h"
@@ -575,6 +578,9 @@ void __time_critical_func(render_core)() {
             frame_count = graphics_frame_count; // the vertical blank of the display
             frame_show();
         }
+#endif
+#if HWAY
+        hway_poll(); // the AY bus belongs to this core
 #endif
         if (tick >= last_input_tick + frame_tick * 1) {
             ps2kbd.tick();
@@ -2527,6 +2533,28 @@ void menu() {
     graphics_set_mode(GRAPHICSMODE_DEFAULT);
 }
 
+#if HWAY
+/* Without the I2S DMA nothing waits for the sound: keep the Game Boy frame
+ * rate (70224 cycles of 4194304 Hz = 16742.7 us) by the timer.  After a
+ * stop (menu, file browser, slow frames) the count starts again. */
+static void hway_frame_wait() {
+    static uint64_t t0;
+    static uint32_t frames;
+    const uint64_t now = time_us_64();
+    uint64_t target = t0 + (uint64_t)(frames + 1) * 70224000000ull / 4194304u;
+    if (!t0 || now > target + 50000u) {
+        t0 = now;
+        frames = 0;
+        return;
+    }
+    while (time_us_64() < target) tight_loop_contents();
+    if (++frames >= 4194304u) { // keep the product in range: restart from here
+        t0 = target;
+        frames = 0;
+    }
+}
+#endif
+
 int main() {
     detect_flash_size();
     overclock();
@@ -2555,12 +2583,16 @@ int main() {
         gpio_put(PICO_DEFAULT_LED_PIN, false);
     }
 
+#if HWAY
+    hway_init(); // the AY chips play the sound, nothing paces the emulator
+#else
     // Initialize I2S sound driver
     i2s_config_t i2s_config = i2s_get_default_config();
     i2s_config.sample_freq = AUDIO_SAMPLE_RATE;
     i2s_config.dma_trans_count = AUDIO_SAMPLES;
     i2s_volume(&i2s_config, 0);
     i2s_init(&i2s_config);
+#endif
 
     // Initialize audio emulation
     audio_init();
@@ -2703,7 +2735,12 @@ int main() {
 
             if (!gb.direct.frame_skip) {
                 audio_callback(NULL, reinterpret_cast<int16_t *>(stream), AUDIO_BUFFER_SIZE_BYTES);
+#if HWAY
+                audio_hway_update();
+                hway_frame_wait();
+#else
                 i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
+#endif
             }
         }
         restart = false;

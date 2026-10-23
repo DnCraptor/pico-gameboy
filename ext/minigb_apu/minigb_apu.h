@@ -42,6 +42,14 @@ void audio_write(const uint16_t addr, const uint8_t val);
  */
 void audio_init(void);
 
+#ifdef HWAY
+/**
+ * Hardware AY-3-8910: the channel state to the chips (once a frame, after
+ * audio_callback()).
+ */
+void audio_hway_update(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

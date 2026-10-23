@@ -429,6 +429,26 @@ void gb_error(struct gb_s* gb, const enum gb_error_e gb_err, const uint16_t addr
 static uint8_t SCREEN_2[2][LCD_HEIGHT][LCD_WIDTH];
 static uint8_t (*const frames[3])[LCD_WIDTH] = {SCREEN, SCREEN_2[0], SCREEN_2[1]};
 
+/* LCD ghosting: the Game Boy screen is slow, a pixel still shows about half
+ * of the previous frame.  Games use it for transparency: a sprite drawn every
+ * second frame is half-transparent there, while a fast screen shows it
+ * flickering.  So a Game Boy (not Color) frame is shown mixed 1:1 with the
+ * previous one: slots 12..77 hold the mixes of two different colours of the
+ * slots 0..11 (a Game Boy Color game has its own palette there). */
+static uint8_t lcd_ghosting = 1;
+static constexpr uint8_t DMG_SLOTS = 12;
+static uint8_t blend_slot[DMG_SLOTS][DMG_SLOTS];
+static uint8_t blend_prev[LCD_HEIGHT][LCD_WIDTH / 2]; // the previous frame, slots 0..11 (4 bits each)
+
+static void blend_slots_init() {
+    uint8_t next = DMG_SLOTS;
+    for (uint8_t a = 0; a < DMG_SLOTS; a++) {
+        blend_slot[a][a] = a;
+        for (uint8_t b = a + 1; b < DMG_SLOTS; b++)
+            blend_slot[a][b] = blend_slot[b][a] = next++;
+    }
+}
+
 /* Game Boy Color palettes often change in the middle of a frame (the status
  * bar under the play field gets its own colours).  The buffers keep 8-bit
  * colour indices, and the video driver turns them into colours while it shows
@@ -708,6 +728,17 @@ void __always_inline lcd_draw_line(struct gb_s* gb, const uint8_t pixels[160], c
             const uint8_t base = cgb_set * 64;
             for (unsigned int x = 0; x < LCD_WIDTH; x++)
                 line[x] = pixels[x] + base;
+        }
+    }
+    else if (lcd_ghosting) {
+        uint8_t* const prev = blend_prev[y];
+        for (unsigned int x = 0; x < LCD_WIDTH; x += 2) {
+            const uint8_t c0 = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
+            const uint8_t c1 = palette[(pixels[x + 1] & LCD_PALETTE_ALL) >> 4][pixels[x + 1] & 3];
+            const uint8_t p = prev[x / 2];
+            line[x] = blend_slot[p & 15][c0];
+            line[x + 1] = blend_slot[p >> 4][c1];
+            prev[x / 2] = c0 | c1 << 4;
         }
     }
     else {
@@ -1518,10 +1549,12 @@ static uint32_t rgb565_to_rgb888(const uint16_t c) {
     return (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
 }
 
-/* the colours in use go to the video driver (slots 0..11); a Game Boy Color
- * game keeps its own palette in slots 0..191 */
+/* the colours in use go to the video driver (slots 0..11, their mixes for
+ * the LCD ghosting 12..77); a Game Boy Color game keeps its own palette in
+ * slots 0..191 */
 static void palette_apply() {
     if (gb.cgb.cgbMode) return;
+    uint32_t rgb[DMG_SLOTS];
     for (int i = 0; i < LAYER_COUNT; i++)
         for (int j = 0; j < 4; j++) {
             const uint32_t c = pal_rgb[i][j];
@@ -1530,6 +1563,14 @@ static void palette_apply() {
             const uint8_t slot = layer_hw[i] * 4 + j;
             graphics_set_palette(slot, RGB888(r, g, b));
             palette[layer_hw[i]][j] = slot;
+            rgb[slot] = c;
+        }
+    for (uint8_t a = 0; a < DMG_SLOTS; a++)
+        for (uint8_t b = a + 1; b < DMG_SLOTS; b++) {
+            const uint32_t r = ((rgb[a] >> 16 & 0xFF) + (rgb[b] >> 16 & 0xFF) + 1) / 2;
+            const uint32_t g = ((rgb[a] >> 8 & 0xFF) + (rgb[b] >> 8 & 0xFF) + 1) / 2;
+            const uint32_t bl = ((rgb[a] & 0xFF) + (rgb[b] & 0xFF) + 1) / 2;
+            graphics_set_palette(blend_slot[a][b], RGB888(r, g, bl));
         }
 }
 
@@ -2223,6 +2264,7 @@ const MenuItem menu_items[] = {
     },
     { "Palette editor", PALETTE_EDITOR },
     { "", GAME_INI, nullptr, &game_ini_action },
+    { "LCD ghosting: %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
     {},
     { "Save state: %i", INT, &save_slot, &save, 8 },
     { "Load state: %i", INT, &save_slot, &load, 8 },
@@ -2269,6 +2311,7 @@ static void f_load_conf(void) {
             *val++ = '\0';
             const unsigned long d = strtoul(val, nullptr, 10);
             if (!strcmp(line, "swap_ab")) swap_ab = d ? 1 : 0;
+            else if (!strcmp(line, "lcd_ghosting")) lcd_ghosting = d ? 1 : 0;
             else if (!strcmp(line, "tv_system")) tv_system = d <= 1 ? (uint8_t)d : 0;
 #if BACKPLANE
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
@@ -2303,8 +2346,9 @@ static void f_save_conf(void) {
     config_mkdirs();
     config_path(pathname, sizeof pathname);
     static char text[512];
-    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\n",
-                       (unsigned)swap_ab, (unsigned)tv_system, (unsigned)screen_scale, (unsigned)palette_all);
+    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\n",
+                       (unsigned)swap_ab, (unsigned)tv_system, (unsigned)screen_scale, (unsigned)palette_all,
+                       (unsigned)lcd_ghosting);
     for (unsigned i = 0; i < LAYER_COUNT && len > 0 && len < (int)sizeof text; i++)
         len += snprintf(text + len, sizeof text - len, "palette%u=%u\r\ncustom%u=%06lX,%06lX,%06lX,%06lX\r\n",
                         i, (unsigned)palette_index[i], i,
@@ -2495,6 +2539,7 @@ int main() {
     sem_init(&vga_start_semaphore, 0, 1);
     critical_section_init(&frame_lock);
     cube_pal_init();
+    blend_slots_init();
     multicore_launch_core1(render_core);
     sem_release(&vga_start_semaphore);
     // Do not draw before the video driver has its text buffer:

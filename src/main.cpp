@@ -161,6 +161,12 @@ semaphore vga_start_semaphore;
 static volatile bool render_ready = false;
 
 gb_s gb;
+/* True only after a successful gb_init().  A menu entered from the ROM
+ * browser must never use a non-initialised (or failed) GB context. */
+static bool gb_initialized = false;
+/* A failed partial SD -> PSRAM/flash write may have damaged the ROM
+ * underlying a still-running GB context.  Never resume it via F10. */
+static bool rom_image_damaged = false;
 
 uint8_t SCREEN[LCD_HEIGHT][LCD_WIDTH];
 static FATFS fs;
@@ -1052,6 +1058,8 @@ bool filebrowser_loadfile(const char pathname[256]) {
     draw_text(use_psram ? "Loading into QSPI PSRAM..." : "Loading into Flash...",
               window_x + 1, window_y + 2, 10, 1);
 
+    // A read/write failure after this point leaves the old image unusable.
+    rom_image_damaged = true;
     size_t total_read = 0;
     UINT bytes_read = 0;
     bool verify_failed = false;
@@ -1128,6 +1136,7 @@ bool filebrowser_loadfile(const char pathname[256]) {
         rom_in_psram = 0; // a PSRAM copy, if any, is no longer the latest ROM
         rom = FLASH_ROM;
     }
+    rom_image_damaged = false;
     return true;
 }
 
@@ -1328,11 +1337,24 @@ void filebrowser(const char* executables) {
                 return;
             }
 
-            // SELECT: run the previous cartridge; START+SELECT: and open the menu (as in the game)
-            if ((keys & BTN_SELECT) ||
-                (keys & BTN_START && (input_held() & (BTN_START | BTN_SELECT)) == (BTN_START | BTN_SELECT))) {
-                fb_menu_requested = (input_held() & BTN_START) != 0;
-                fb_remember(basepath, fileItems[offset + current_item].filename);
+            // START+SELECT opens settings, independently of whether a ROM exists.
+            // SELECT alone still runs the previous cartridge.
+            const uint8_t held = input_held();
+            if ((held & (BTN_START | BTN_SELECT)) == (BTN_START | BTN_SELECT) &&
+                (keys & (BTN_START | BTN_SELECT))) {
+                fb_menu_requested = true;
+                fb_rom_ready = false;
+                fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
+                return;
+            }
+            if (keys & BTN_SELECT) {
+                if (rom_image_damaged) {
+                    draw_text("Previous ROM incomplete; load another", 1, 1, 12, 0);
+                    sleep_ms(1200);
+                    break; // redraw the browser, not a broken cartridge
+                }
+                fb_menu_requested = false;
+                fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
                 rom = previous_rom();
                 fb_rom_ready = true;
                 return;
@@ -2654,6 +2676,10 @@ static void menu_frame() {
 static bool menu_item_selectable(const unsigned i) {
     const MenuItem& item = menu_items[i];
     if (item.type == NONE) return false;
+    // Save states, per-game colours and the editor require a valid GB context.
+    if (!gb_initialized &&
+        (item.callback == &save || item.callback == &load ||
+         item.type == GAME_INI || item.type == PALETTE_EDITOR)) return false;
     for (unsigned layer = 0; layer < LAYER_COUNT; layer++)
         if (item.value == &palette_index[layer]) return palette_all == PALETTE_CUSTOM;
 #if BACKPLANE
@@ -2676,7 +2702,7 @@ void menu() {
         const uint8_t pressed = held_keys & (uint8_t)~prev_keys;
         prev_keys = held_keys;
         const bool activate = pressed & BTN_START;
-        const bool dmg = !gb.cgb.cgbMode; // the colours are for Game Boy games
+        const bool dmg = gb_initialized && !gb.cgb.cgbMode; // only a loaded DMG game
 
         for (int i = 0; i < MENU_ITEMS_NUMBER; i++) {
             uint8_t y = i + (TEXTMODE_ROWS - MENU_ITEMS_NUMBER >> 1);
@@ -2709,10 +2735,10 @@ void menu() {
                                     randomize_layer(layer);
                                 if (old != *value || activate) {
                                     if (old != *value) palette16_select = 0;
-                                    update_palette();
+                                    if (gb_initialized) update_palette();
                                 }
                             }
-                            if (item->value == &palette16_select && (old != *value || activate))
+                            if (item->value == &palette16_select && (old != *value || activate) && gb_initialized)
                                 update_palette();
                         }
                         break;
@@ -2823,8 +2849,10 @@ void menu() {
         sleep_ms(25);
     }
     palette_hotkeys_clear();
-    palette_apply();
-    palette16_apply();
+    if (gb_initialized) {
+        palette_apply();
+        palette16_apply();
+    }
     f_save_conf();
 #if SOFTTV
     graphics_set_tv(tv_system == 0, true); // applied by graphics_set_mode()
@@ -2923,6 +2951,12 @@ int main() {
 
     bool browser_rom_preloaded = false;
     while (true) {
+        // The previous game's state is no longer running.  Only a successful
+        // gb_init() below permits entry into the emulator's frame loop.
+        gb_initialized = false;
+#if VGA || HDMI || SOFTTV
+        graphics_set_overlay(nullptr, false);
+#endif
         /* The automatic demonstration advances without opening a browser.
          * The regular F10 path sets browser_rom_preloaded for a manual ROM. */
         bool demo_loaded = false;
@@ -2938,6 +2972,7 @@ int main() {
             if (!demo_loaded) demo_active = false;
         }
         if (FR_OK == fr && !browser_rom_preloaded && !demo_loaded) {
+            fb_rom_ready = false; // a previous browser selection is not a new launch
             graphics_set_mode(TEXTMODE_DEFAULT);
 #if BACKPLANE
             filebrowser("gbc,gb,gbbp"); // .gbbp: a backplane to install
@@ -2946,20 +2981,41 @@ int main() {
 #endif
             if (demo_requested) { // B from the browser
                 demo_requested = false;
-                if (!demo_begin()) continue; // let the user choose another folder
+                demo_loaded = demo_begin();
+                if (!demo_loaded) continue; // let the user choose another folder
             }
         }
-        if (!browser_rom_preloaded || demo_loaded) graphics_set_mode(GRAPHICSMODE_DEFAULT);
+        const bool cartridge_selected = browser_rom_preloaded || demo_loaded || fb_rom_ready;
         browser_rom_preloaded = false;
 
+        // Browser settings are accessible without any loaded cartridge.
+        // Do NOT initialise (or run) a nonexistent previous ROM just to open
+        // the menu.  On Return, visit the ROM browser instead of running GB.
+        if (fb_menu_requested) {
+            fb_menu_requested = false;
+            menu();
+            restart = false;
+            continue;
+        }
+        if (!cartridge_selected) continue;
+
+        graphics_set_mode(GRAPHICSMODE_DEFAULT);
         /* Initialise GB context. */
         cgb_palette_reset();
-        gb_init_error_e ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read,
-                                      &gb_cart_ram_write, &gb_error, nullptr);
-
+        const gb_init_error_e ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read,
+                                            &gb_cart_ram_write, &gb_error, nullptr);
         if (ret != GB_INIT_NO_ERROR) {
-            while (1) draw_text("error", 1, 1, 1, 2);
+            // A bad/absent cartridge is not a fatal firmware error.  No GB
+            // frames, cart RAM or per-game palettes may be accessed here.
+            printf("E gb_init error: %u\n", (unsigned)ret);
+            demo_active = demo_requested = demo_advance_pending = false;
+            graphics_set_mode(TEXTMODE_DEFAULT);
+            draw_text("Invalid or unsupported Game Boy ROM", 1, 1, 12, 0);
+            sleep_ms(1200);
+            restart = false;
+            continue;
         }
+        gb_initialized = true;
 
         /* The colours of a Game Boy game: the palette saved for it, or the selected one */
         apply_game_palette_on_load();
@@ -3002,6 +3058,14 @@ int main() {
 #endif
                 fb_can_cancel = false;
                 graphics_set_mode(GRAPHICSMODE_DEFAULT);
+                if (fb_canceled && rom_image_damaged) {
+                    // A failed ROM replacement may have overwritten the game's
+                    // PSRAM/flash bytes.  Returning to it would run corrupt code.
+                    fb_canceled = false;
+                    demo_active = demo_requested = demo_advance_pending = false;
+                    restart = true;
+                    break;
+                }
                 if (fb_canceled) {
                     fb_canceled = false;
                     demo_active = was_demo;

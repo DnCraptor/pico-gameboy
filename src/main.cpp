@@ -283,17 +283,30 @@ static volatile bool palette_default_requested = false;         // F9
 static volatile bool palette_editor_requested = false;          // F12
 static volatile bool filebrowser_toggle_requested = false;     // F10: browser / return
 
+/* R / P in the ROM browser arm a recording or its playback for the selected
+ * cartridge.  Keyboard reports are produced on core 1. */
+static volatile bool replay_browser_active = false;
+static volatile uint8_t replay_browser_command = 0;
+enum replay_launch_t : uint8_t { REPLAY_LAUNCH_NORMAL, REPLAY_LAUNCH_RECORD, REPLAY_LAUNCH_PLAY };
+static replay_launch_t replay_launch = REPLAY_LAUNCH_NORMAL;
+
 void
 __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
     /*    printf("HID key report modifiers %2.2X report ", report->modifier);
         for (unsigned char i: report->keycode)
             printf("%2.2X", i);
         printf("\r\n");*/
+    if (replay_browser_active) {
+        if (isInReport(report, HID_KEY_R) && !isInReport(prev_report, HID_KEY_R))
+            replay_browser_command = 'R';
+        if (isInReport(report, HID_KEY_P) && !isInReport(prev_report, HID_KEY_P))
+            replay_browser_command = 'P';
+    }
     keyboard.start = isInReport(report, HID_KEY_ENTER) || isInReport(report, HID_KEY_KEYPAD_ENTER);
     keyboard.select = isInReport(report, HID_KEY_BACKSPACE) || isInReport(report, HID_KEY_ESCAPE) || isInReport(report, HID_KEY_KEYPAD_ADD);
 
     keyboard.a = isInReport(report, HID_KEY_Z) || isInReport(report, HID_KEY_O) || isInReport(report, HID_KEY_KEYPAD_0);
-    keyboard.b = isInReport(report, HID_KEY_X) || isInReport(report, HID_KEY_P) || isInReport(report, HID_KEY_KEYPAD_DECIMAL);
+    keyboard.b = isInReport(report, HID_KEY_X) || (!replay_browser_active && isInReport(report, HID_KEY_P)) || isInReport(report, HID_KEY_KEYPAD_DECIMAL);
 
     bool b7 = isInReport(report, HID_KEY_KEYPAD_7);
     bool b9 = isInReport(report, HID_KEY_KEYPAD_9);
@@ -1215,6 +1228,9 @@ void filebrowser(const char* executables) {
     strcpy(basepath, fb_dir);
     strcpy(focus, fb_focus);
     constexpr int per_page = TEXTMODE_ROWS - 3;
+    replay_browser_command = 0;
+    replay_browser_active = true;
+    replay_launch = REPLAY_LAUNCH_NORMAL;
 
     DIR dir;
     FILINFO fileInfo;
@@ -1256,15 +1272,17 @@ void filebrowser(const char* executables) {
         draw_text(" Demo ", off, 29, 0, 3);
         off += 6;
 #ifndef TFT
-        off += 16;
-        draw_text("ARROWS", off, 29, 7, 0);
-        off += 6;
-        draw_text(" Navigation    ", off, 29, 0, 3);
-        off += 16;
-        if (fb_can_cancel) {
-            draw_text("F10", off, 29, 7, 0);
-            off += 3;
-            draw_text(" Return to game ", off, 29, 0, 3);
+        if (off + 15 <= TEXTMODE_COLS) {
+            off++;
+            draw_text("R", off++, 29, 7, 0);
+            draw_text(" REC ", off, 29, 0, 3); off += 5;
+            draw_text("P", off++, 29, 7, 0);
+            draw_text(" PLAY ", off, 29, 0, 3); off += 6;
+        }
+        if (fb_can_cancel && off + 11 <= TEXTMODE_COLS) {
+            off++;
+            draw_text("F10", off, 29, 7, 0); off += 3;
+            draw_text(" Return ", off, 29, 0, 3);
         }
 #endif
 
@@ -1319,12 +1337,33 @@ void filebrowser(const char* executables) {
             sleep_ms(100);
 
             const uint8_t keys = gate.read();
+            const uint8_t replay_command = replay_browser_command;
+            replay_browser_command = 0;
+            if (replay_command && total_files > 0) {
+                const file_item_t item = fileItems[offset + current_item];
+                const char* dot = strrchr(item.filename, '.');
+                if (!item.is_directory && item.is_executable && dot &&
+                    (!strcasecmp(dot, ".gb") || !strcasecmp(dot, ".gbc"))) {
+                    char fullpath[256];
+                    if (snprintf(fullpath, sizeof fullpath, "%s\\%s", basepath, item.filename) < (int)sizeof fullpath &&
+                        filebrowser_loadfile(fullpath)) {
+                        fb_remember(basepath, item.filename);
+                        fb_rom_ready = true;
+                        replay_launch = replay_command == 'R' ? REPLAY_LAUNCH_RECORD : REPLAY_LAUNCH_PLAY;
+                        replay_browser_active = false;
+                        return;
+                    }
+                    strcpy(focus, item.filename);
+                    break; // redraw after the ROM loader's status window
+                }
+            }
 
             if (filebrowser_toggle_requested) {
                 filebrowser_toggle_requested = false;
                 if (fb_can_cancel) {
                     fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
                     fb_canceled = true;
+                    replay_browser_active = false;
                     return;
                 }
             }
@@ -1334,6 +1373,7 @@ void filebrowser(const char* executables) {
                 fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
                 demo_requested = true;
                 fb_rom_ready = false;
+                replay_browser_active = false;
                 return;
             }
 
@@ -1345,6 +1385,7 @@ void filebrowser(const char* executables) {
                 fb_menu_requested = true;
                 fb_rom_ready = false;
                 fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
+                replay_browser_active = false;
                 return;
             }
             if (keys & BTN_SELECT) {
@@ -1357,6 +1398,7 @@ void filebrowser(const char* executables) {
                 fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
                 rom = previous_rom();
                 fb_rom_ready = true;
+                replay_browser_active = false;
                 return;
             }
 
@@ -1461,6 +1503,7 @@ void filebrowser(const char* executables) {
                     if (path_ok && filebrowser_loadfile(fullpath)) {
                         fb_remember(basepath, file_at_cursor.filename);
                         fb_rom_ready = true;
+                        replay_browser_active = false;
                         return;
                     }
                     // the error window covered the list: redraw it, same entry
@@ -1615,20 +1658,261 @@ static void state_path(char* pathname, size_t size, const char* dir) {
         snprintf(pathname, size, "%s/%s.save", dir, filename);
 }
 
+/* A Watara-style input movie: one event whenever the joypad changes, indexed
+ * by emulated frame, not wall time.  No allocation and no SD I/O for unchanged
+ * inputs.  A state contains the recording's session ID and current file offset:
+ * loading that state truncates the movie and starts a new branch.  The first
+ * 32 KiB of cartridge RAM are stored with the movie for deterministic replay.
+ * A .gbr file is intentionally not binary-compatible with Watara .wvr. */
+static constexpr uint32_t REPLAY_MAGIC = 0x31524247u;       // GBR1
+static constexpr uint32_t REPLAY_STATE_MAGIC = 0x31534247u; // GBS1
+struct __attribute__((packed)) replay_header_t {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_size;
+    uint32_t rom_bytes;
+    uint32_t rom_tag;
+    uint64_t session_id;
+    uint32_t total_frames;
+    char rom_name[24];
+};
+struct __attribute__((packed)) replay_event_t {
+    uint32_t frame;
+    uint8_t input;
+};
+struct __attribute__((packed)) replay_state_t {
+    uint32_t magic;
+    uint64_t session_id;
+    uint32_t frame;
+    uint32_t file_offset;
+    uint8_t input;
+    uint8_t reserved[3];
+};
+enum replay_mode_t : uint8_t { REPLAY_OFF, REPLAY_RECORD, REPLAY_PLAY };
+static replay_mode_t replay_mode = REPLAY_OFF;
+static FIL replay_file;
+static bool replay_file_open = false;
+static uint64_t replay_session_id = 0;
+static uint32_t replay_frame = 0, replay_total_frames = 0;
+static uint8_t replay_input = 0, replay_last_input = 0xff;
+static replay_event_t replay_next = {};
+static bool replay_next_valid = false;
+static uint32_t replay_osd_second = UINT32_MAX;
+
+/* Header code 0x148 specifies ROM size; no volatile filename or flash offset
+ * needs to survive a reset for R/P to recognise the same cartridge. */
+static uint32_t replay_cart_bytes() {
+    const uint8_t code = rom[0x148];
+    if (code <= 8) return 32768u << code;
+    if (code == 0x52) return 72u * 16384u;
+    if (code == 0x53) return 80u * 16384u;
+    if (code == 0x54) return 96u * 16384u;
+    return 0;
+}
+static uint32_t replay_cart_tag() {
+    uint32_t hash = 2166136261u;
+    for (unsigned i = 0x134; i <= 0x14f; ++i) {
+        hash ^= rom[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+static void replay_cart_name(char name[24]) {
+    unsigned i = 0;
+    for (; i < 16; ++i) {
+        const uint8_t c = rom[0x134 + i];
+        if (!c) break;
+        name[i] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') ? (char)c : '_';
+    }
+    name[i] = '\0';
+    if (!i) strcpy(name, "UNTITLED");
+}
+static void replay_path(char* out, const size_t size) {
+    char name[24];
+    replay_cart_name(name);
+    snprintf(out, size, CONFIG_DIR "/replay/%s-%08lX.gbr", name,
+             (unsigned long)replay_cart_tag());
+}
+static bool replay_checkpoint() {
+    if (!replay_file_open || replay_mode != REPLAY_RECORD) return false;
+    const FSIZE_t position = f_tell(&replay_file);
+    UINT written = 0;
+    return f_lseek(&replay_file, offsetof(replay_header_t, total_frames)) == FR_OK &&
+           f_write(&replay_file, &replay_frame, sizeof replay_frame, &written) == FR_OK &&
+           written == sizeof replay_frame &&
+           f_lseek(&replay_file, position) == FR_OK && f_sync(&replay_file) == FR_OK;
+}
+static void replay_stop() {
+    const bool had_recording = replay_mode == REPLAY_RECORD;
+    if (replay_file_open) {
+        if (had_recording) replay_checkpoint();
+        f_close(&replay_file);
+    }
+    replay_file_open = false;
+    replay_mode = REPLAY_OFF;
+    replay_next_valid = false;
+    replay_osd_second = UINT32_MAX;
+#if VGA || HDMI || SOFTTV
+    if (had_recording) graphics_set_overlay(nullptr, false);
+#endif
+}
+static void replay_read_next() {
+    UINT received = 0;
+    replay_next_valid = replay_file_open && replay_mode == REPLAY_PLAY &&
+        f_read(&replay_file, &replay_next, sizeof replay_next, &received) == FR_OK &&
+        received == sizeof replay_next;
+}
+static bool replay_start(const bool record) {
+    replay_stop();
+    if (record) {
+        config_mkdirs();
+        f_mkdir(CONFIG_DIR "/replay");
+    }
+    char path[256];
+    replay_path(path, sizeof path);
+    if (f_open(&replay_file, path, record ? FA_CREATE_ALWAYS | FA_WRITE : FA_READ) != FR_OK)
+        return false;
+    replay_file_open = true;
+    replay_header_t header = {};
+    UINT io = 0;
+    char name[24] = {};
+    replay_cart_name(name);
+    if (record) {
+        header.magic = REPLAY_MAGIC;
+        header.version = 1;
+        header.header_size = sizeof header;
+        header.rom_bytes = replay_cart_bytes();
+        header.rom_tag = replay_cart_tag();
+        header.session_id = time_us_64();
+        memcpy(header.rom_name, name, sizeof name);
+        if (f_write(&replay_file, &header, sizeof header, &io) != FR_OK || io != sizeof header ||
+            f_write(&replay_file, ram, sizeof ram, &io) != FR_OK || io != sizeof ram) {
+            replay_stop();
+            return false;
+        }
+        replay_mode = REPLAY_RECORD;
+        if (f_sync(&replay_file) != FR_OK) { replay_stop(); return false; }
+    } else {
+        if (f_read(&replay_file, &header, sizeof header, &io) != FR_OK || io != sizeof header ||
+            header.magic != REPLAY_MAGIC || header.version != 1 ||
+            header.header_size != sizeof header || header.rom_bytes != replay_cart_bytes() ||
+            header.rom_tag != replay_cart_tag() ||
+            memcmp(header.rom_name, name, sizeof name) != 0 ||
+            f_read(&replay_file, ram, sizeof ram, &io) != FR_OK || io != sizeof ram) {
+            replay_stop();
+            return false;
+        }
+        replay_mode = REPLAY_PLAY;
+    }
+    replay_session_id = header.session_id;
+    replay_frame = 0;
+    replay_total_frames = header.total_frames;
+    replay_input = 0;
+    replay_last_input = 0xff;
+    replay_osd_second = UINT32_MAX;
+    if (!record) replay_read_next();
+    return true;
+}
+static uint8_t replay_begin_frame(const uint8_t physical_input) {
+    if (replay_mode == REPLAY_RECORD) {
+        replay_input = physical_input;
+        if (replay_input != replay_last_input) {
+            const replay_event_t event = { replay_frame, replay_input };
+            UINT written = 0;
+            if (f_write(&replay_file, &event, sizeof event, &written) != FR_OK ||
+                written != sizeof event) {
+                replay_stop();
+                return physical_input;
+            }
+            replay_last_input = replay_input;
+        }
+    } else if (replay_mode == REPLAY_PLAY) {
+        if (replay_frame >= replay_total_frames) {
+            replay_stop();
+            return physical_input;
+        }
+        while (replay_next_valid && replay_next.frame == replay_frame) {
+            replay_input = replay_next.input;
+            replay_read_next();
+        }
+        if (replay_next_valid && replay_next.frame < replay_frame) {
+            replay_stop();
+            return physical_input;
+        }
+    } else return physical_input;
+    return replay_input;
+}
+static void replay_end_frame() {
+    if (replay_mode == REPLAY_OFF) return;
+    ++replay_frame;
+    if (replay_mode == REPLAY_RECORD && replay_frame % 60u == 0u && !replay_checkpoint())
+        replay_stop();
+}
+static replay_state_t replay_make_state() {
+    replay_state_t state = {};
+    if (replay_mode == REPLAY_RECORD && replay_file_open) {
+        if (!replay_checkpoint()) { replay_stop(); return state; }
+        const FSIZE_t position = f_tell(&replay_file);
+        if (position > UINT32_MAX) { replay_stop(); return state; }
+        state.magic = REPLAY_STATE_MAGIC;
+        state.session_id = replay_session_id;
+        state.frame = replay_frame;
+        state.file_offset = (uint32_t)position;
+        state.input = replay_input;
+    }
+    return state;
+}
+static void replay_restore_state(const replay_state_t& state) {
+    if (replay_mode == REPLAY_PLAY) { replay_stop(); return; }
+    if (replay_mode != REPLAY_RECORD || !replay_file_open) return;
+    if (state.magic != REPLAY_STATE_MAGIC || state.session_id != replay_session_id ||
+        state.file_offset < sizeof(replay_header_t) + sizeof ram ||
+        state.file_offset > f_size(&replay_file) ||
+        f_lseek(&replay_file, state.file_offset) != FR_OK ||
+        f_truncate(&replay_file) != FR_OK) {
+        replay_stop();
+        return;
+    }
+    replay_frame = state.frame;
+    replay_input = state.input;
+    replay_last_input = 0xff; // write a new first event on the replacement branch
+    replay_osd_second = UINT32_MAX;
+    if (!replay_checkpoint()) replay_stop();
+}
+static void replay_draw_record_overlay() {
+#if VGA || HDMI || SOFTTV
+    if (replay_mode != REPLAY_RECORD) return;
+    const uint32_t seconds = replay_frame / 60u;
+    if (seconds == replay_osd_second) return;
+    replay_osd_second = seconds;
+    char label[53];
+    snprintf(label, sizeof label, "REC %02lu:%02lu:%02lu",
+             (unsigned long)(seconds / 3600u),
+             (unsigned long)((seconds / 60u) % 60u),
+             (unsigned long)(seconds % 60u));
+    graphics_set_overlay(label, true);
+#endif
+}
+
 static bool save() {
     char pathname[255];
     config_mkdirs();
     state_path(pathname, sizeof pathname, CONFIG_DIR);
 
+    // Flush the movie BEFORE opening the save-state file.  Every state stores
+    // the session/frame/file offset required for an exact recording rollback.
+    const replay_state_t replay_state = replay_make_state();
     static FIL fd; // static: core 0 has a small stack
     if (FR_OK != f_open(&fd, pathname, FA_CREATE_ALWAYS | FA_WRITE))
-        return true;
-    UINT bw;
-    f_write(&fd, &gb, sizeof(gb), &bw);
-    f_write(&fd, ram, sizeof(ram), &bw);
-    f_close(&fd);
-
-    return true;
+        return false;
+    UINT bw = 0;
+    const bool gb_ok = f_write(&fd, &gb, sizeof gb, &bw) == FR_OK && bw == sizeof gb;
+    const bool ram_ok = gb_ok && f_write(&fd, ram, sizeof ram, &bw) == FR_OK && bw == sizeof ram;
+    const bool replay_ok = ram_ok &&
+        f_write(&fd, &replay_state, sizeof replay_state, &bw) == FR_OK && bw == sizeof replay_state;
+    const bool closed = f_close(&fd) == FR_OK;
+    return replay_ok && closed;
 }
 
 static bool load() {
@@ -1638,12 +1922,20 @@ static bool load() {
     if (FR_OK != f_open(&fd, pathname, FA_READ)) {
         state_path(pathname, sizeof pathname, HOME_DIR); // saved by an older version
         if (FR_OK != f_open(&fd, pathname, FA_READ))
-            return true;
+            return false;
     }
-    UINT br;
-    f_read(&fd, &gb, sizeof(gb), &br);
-    f_read(&fd, ram, sizeof(ram), &br);
+    // Old save files have just gb + RAM; new ones append the replay marker.
+    if (f_size(&fd) < sizeof gb + sizeof ram) { f_close(&fd); return false; }
+    UINT br = 0;
+    const bool gb_ok = f_read(&fd, &gb, sizeof gb, &br) == FR_OK && br == sizeof gb;
+    const bool ram_ok = gb_ok && f_read(&fd, ram, sizeof ram, &br) == FR_OK && br == sizeof ram;
+    replay_state_t replay_state = {};
+    const bool marker_ok = ram_ok &&
+        f_read(&fd, &replay_state, sizeof replay_state, &br) == FR_OK && br == sizeof replay_state;
     f_close(&fd);
+    if (!ram_ok) { replay_stop(); return false; }
+    if (marker_ok) replay_restore_state(replay_state);
+    else if (replay_mode != REPLAY_OFF) replay_stop();
     cgb_palette_reset(); // the loaded GBC palette is not in the video driver yet
     return true;
 }
@@ -2690,6 +2982,11 @@ static bool menu_item_selectable(const unsigned i) {
 
 void menu() {
     bool exit = false;
+#if VGA || HDMI || SOFTTV
+    // Keep the REC bar out of the text menu, resume it at the next game frame.
+    if (replay_mode == REPLAY_RECORD) graphics_set_overlay(nullptr, false);
+    replay_osd_second = UINT32_MAX;
+#endif
     graphics_set_mode(TEXTMODE_DEFAULT);
     menu_frame();
     uint current_item = 0;
@@ -2951,6 +3248,8 @@ int main() {
 
     bool browser_rom_preloaded = false;
     while (true) {
+        // A ROM switch, menu reset or Demo selection ends an old movie.
+        replay_stop();
         // The previous game's state is no longer running.  Only a successful
         // gb_init() below permits entry into the emulator's frame loop.
         gb_initialized = false;
@@ -3024,6 +3323,16 @@ int main() {
         gb_init_lcd(&gb, &lcd_draw_line);
         /* Load Save File. */
         read_cart_ram_file(&gb);
+        if (replay_launch != REPLAY_LAUNCH_NORMAL) {
+            const bool record = replay_launch == REPLAY_LAUNCH_RECORD;
+            replay_launch = REPLAY_LAUNCH_NORMAL;
+            if (!replay_start(record)) {
+                graphics_set_mode(TEXTMODE_DEFAULT);
+                draw_text(record ? "Could not start recording" : "Replay missing or incompatible", 1, 1, 12, 0);
+                sleep_ms(1500);
+                continue;
+            }
+        }
 
         // the Enter/Start that launched the ROM must not reach the game
         input_gate_t game_gate;
@@ -3050,6 +3359,9 @@ int main() {
                 const uint64_t browser_started_at = time_us_64();
                 demo_active = false;
                 demo_advance_pending = false;
+                // FatFs replay file must be closed before the ROM browser or
+                // its PSRAM/flash loader touches the SD card.
+                replay_stop();
                 graphics_set_mode(TEXTMODE_DEFAULT);
 #if BACKPLANE
                 filebrowser("gbc,gb,gbbp");
@@ -3098,20 +3410,12 @@ int main() {
                 fxPressedV = 0; // once per key press, not on every frame
             }
             const uint8_t keys = game_gate.read();
-            gb.direct.joypad_bits.up = !(keys & BTN_UP);
-            gb.direct.joypad_bits.down = !(keys & BTN_DOWN);
-            gb.direct.joypad_bits.left = !(keys & BTN_LEFT);
-            gb.direct.joypad_bits.right = !(keys & BTN_RIGHT);
-            gb.direct.joypad_bits.a = !(keys & BTN_A);
-            gb.direct.joypad_bits.b = !(keys & BTN_B);
-            gb.direct.joypad_bits.select = !(keys & BTN_SELECT);
-            gb.direct.joypad_bits.start = !(keys & BTN_START);
-
-            //gb.direct.joypad = nespad_state;
+            // The menu is a host action, never part of the recorded GB input.
             //------------------------------------------------------------------------------
             /* hotkeys (select + * combo)*/
             static int keydown_counter = 0;
-            if (!(gb.direct.joypad & 0b00001100) || nespad_state & DPAD_X) {
+            if ((keys & (BTN_SELECT | BTN_START)) == (BTN_SELECT | BTN_START) ||
+                (nespad_state & DPAD_X)) {
                 char romname[24];
 
                 gb_get_rom_name(&gb, romname);
@@ -3158,8 +3462,21 @@ int main() {
             if (handle_palette_hotkeys())
                 game_gate.arm(); // the keys that closed the palette editor
 
+            // Replay input belongs to the emulated frame AFTER all host/menu
+            // actions; loading a saved state can rewind replay_frame above.
+            const uint8_t game_keys = replay_begin_frame(game_gate.read());
+            gb.direct.joypad_bits.up = !(game_keys & BTN_UP);
+            gb.direct.joypad_bits.down = !(game_keys & BTN_DOWN);
+            gb.direct.joypad_bits.left = !(game_keys & BTN_LEFT);
+            gb.direct.joypad_bits.right = !(game_keys & BTN_RIGHT);
+            gb.direct.joypad_bits.a = !(game_keys & BTN_A);
+            gb.direct.joypad_bits.b = !(game_keys & BTN_B);
+            gb.direct.joypad_bits.select = !(game_keys & BTN_SELECT);
+            gb.direct.joypad_bits.start = !(game_keys & BTN_START);
+
             //-----------------------------------------------------------------
             gb_run_frame(&gb);
+            replay_end_frame();
 
             //gb.direct.interlace = 1;
 
@@ -3173,7 +3490,8 @@ int main() {
 #endif
             }
 #if VGA || HDMI || SOFTTV
-            demo_draw_title_overlay();
+            if (replay_mode == REPLAY_RECORD) replay_draw_record_overlay();
+            else demo_draw_title_overlay();
 #endif
             if (demo_active && time_us_64() - demo_game_started_at >=
                                (uint64_t)demo_seconds[demo_duration] * 1000000ull) {

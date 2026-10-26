@@ -1957,8 +1957,18 @@ static bool load() {
     return true;
 }
 /* TV-SOFT: a TV standard is a coherent set (lines, colour subcarrier,
- * sync), so the menu only selects the system; the game is always in colour. */
+ * sync), so the menu selects the system; Colors NO sends no colour subcarrier
+ * (a black and white picture, as on a black and white TV). */
 static uint8_t tv_system = 0; // 0 - PAL, 1 - NTSC
+static uint8_t tv_color = 1;
+/* VGA / HDMI, 2x and 3x: the gaps between the pixels in grey (as on the LCD)
+ * - VGA: 0 - no, 1 - vertical, 2 - horizontal, 3 - both (GRAPHICS_GRAY_*);
+ * HDMI: 0 / 2 (horizontal only, the menu shows OFF / ON); grey 0..3 */
+static uint8_t gray_lines = 0;
+static uint8_t gray_level = 1;
+#if HDMI
+static uint8_t gray_lines_menu = 0; // OFF / ON
+#endif
 /* HDMI / VGA / TV-SOFT: picture size (enum graphics_scale_t), by default as
  * the drivers showed it before: HDMI and TV 2x, VGA 3x */
 #if VGA
@@ -2061,6 +2071,22 @@ static bool gbbp_try_install(const char* pathname) {
 #else
 static bool gbbp_try_install(const char*) { return false; }
 #endif
+/* the video settings of the menu to the driver */
+static void apply_video_settings() {
+#if SOFTTV
+    graphics_set_tv(tv_system == 0, tv_color != 0); // applied by the next graphics_set_mode()
+#endif
+#if VGA || HDMI || SOFTTV
+    graphics_set_scale((enum graphics_scale_t)screen_scale);
+#endif
+#if VGA || HDMI
+    graphics_set_gray_lines(gray_lines, gray_level);
+#endif
+#if BACKPLANE
+    apply_backplane();
+#endif
+}
+
 #ifdef TEXTMODE_COLS_MAX // text columns change at run time (TV-SOFT)
 #define TEXT_BUFFER_COLS TEXTMODE_COLS_MAX
 #else
@@ -2867,6 +2893,7 @@ const MenuItem menu_items[] = {
 #if SOFTTV
     { "" },
     { "TV system %s", ARRAY, &tv_system, nullptr, 1, { "PAL ", "NTSC" } },
+    { "Colors: %s", ARRAY, &tv_color, nullptr, 1, { "NO ", "YES" } },
 #endif
 #if VGA || HDMI || SOFTTV
     { "" },
@@ -2874,6 +2901,14 @@ const MenuItem menu_items[] = {
 #if BACKPLANE
     { "Backplane: %s", ARRAY, &backplane, nullptr, 1, { "OFF", "ON " } },
 #endif
+#endif
+#if VGA
+    { "Gray lines: %s", ARRAY, &gray_lines, nullptr, 3, { "No        ", "Vertical  ", "Horizontal", "Both      " } },
+#elif HDMI
+    { "Gray lines: %s", ARRAY, &gray_lines_menu, nullptr, 1, { "OFF", "ON " } },
+#endif
+#if VGA || HDMI
+    { "Gray level: %s", ARRAY, &gray_level, nullptr, 3, { "0", "1", "2", "3" } },
 #endif
     {},
 {
@@ -2913,6 +2948,9 @@ static void f_load_conf(void) {
             else if (!strcmp(line, "demo_name")) demo_name = d ? 1 : 0;
             else if (!strcmp(line, "demo_timer_osd")) demo_timer_osd = d ? 1 : 0;
             else if (!strcmp(line, "tv_system")) tv_system = d <= 1 ? (uint8_t)d : 0;
+            else if (!strcmp(line, "tv_color")) tv_color = d ? 1 : 0;
+            else if (!strcmp(line, "gray_lines")) gray_lines = d <= 3 ? (uint8_t)d : 0;
+            else if (!strcmp(line, "gray_level")) gray_level = d <= 3 ? (uint8_t)d : 1;
 #if BACKPLANE
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
 #endif
@@ -2940,6 +2978,10 @@ static void f_load_conf(void) {
         if (f_read(&f, &v, 1, &br) == FR_OK && br == 1 && v <= GRAPHICS_SCALE_STRETCH) screen_scale = v;
         f_close(&f);
     }
+#if HDMI
+    gray_lines_menu = gray_lines ? 1 : 0;
+    gray_lines = gray_lines_menu ? GRAPHICS_GRAY_HORIZONTAL : 0;
+#endif
     for (unsigned layer = 0; layer < LAYER_COUNT; layer++) randomize_layer(layer);
 }
 
@@ -2960,6 +3002,9 @@ static void f_save_conf(void) {
                         (unsigned long)custom_rgb[i][2], (unsigned long)custom_rgb[i][3]);
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "palette16=%u\r\n", (unsigned)palette16_global);
+    if (len > 0 && len < (int)sizeof text)
+        len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\n",
+                        (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level);
 #if BACKPLANE
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "backplane=%u\r\n", (unsigned)backplane);
@@ -2993,6 +3038,13 @@ static bool menu_item_selectable(const unsigned i) {
         if (item.value == &palette_index[layer]) return palette_all == PALETTE_CUSTOM;
 #if BACKPLANE
     if (item.value == &backplane) return screen_scale != GRAPHICS_SCALE_STRETCH; // Full has none
+#endif
+#if VGA
+    if (item.value == &gray_lines) return screen_scale != GRAPHICS_SCALE_STRETCH;
+    if (item.value == &gray_level) return screen_scale != GRAPHICS_SCALE_STRETCH && gray_lines;
+#elif HDMI
+    if (item.value == &gray_lines_menu) return screen_scale != GRAPHICS_SCALE_STRETCH;
+    if (item.value == &gray_level) return screen_scale != GRAPHICS_SCALE_STRETCH && gray_lines_menu;
 #endif
     return true;
 }
@@ -3075,15 +3127,7 @@ void menu() {
                             demo_requested = true;
                             demo_advance_pending = false;
                             f_save_conf();
-#if SOFTTV
-                            graphics_set_tv(tv_system == 0, true);
-#endif
-#if VGA || HDMI || SOFTTV
-                            graphics_set_scale((enum graphics_scale_t)screen_scale);
-#endif
-#if BACKPLANE
-                            apply_backplane();
-#endif
+                            apply_video_settings();
                             restart = true;
                             return;
                         }
@@ -3092,15 +3136,7 @@ void menu() {
                         if (activate) {
                             demo_active = demo_requested = demo_advance_pending = false;
                             f_save_conf(); // this exit used to lose the Screen setting
-#if SOFTTV
-                            graphics_set_tv(tv_system == 0, true);
-#endif
-#if VGA || HDMI || SOFTTV
-                            graphics_set_scale((enum graphics_scale_t)screen_scale);
-#endif
-#if BACKPLANE
-                            apply_backplane();
-#endif
+                            apply_video_settings();
                             restart = true;
                             return;
                         }
@@ -3167,16 +3203,11 @@ void menu() {
         palette_apply();
         palette16_apply();
     }
+#if HDMI
+    gray_lines = gray_lines_menu ? GRAPHICS_GRAY_HORIZONTAL : 0;
+#endif
     f_save_conf();
-#if SOFTTV
-    graphics_set_tv(tv_system == 0, true); // applied by graphics_set_mode()
-#endif
-#if VGA || HDMI || SOFTTV
-    graphics_set_scale((enum graphics_scale_t)screen_scale);
-#endif
-#if BACKPLANE
-    apply_backplane();
-#endif
+    apply_video_settings(); // the TV system and colour: applied by graphics_set_mode()
     graphics_set_mode(GRAPHICSMODE_DEFAULT);
 }
 
@@ -3252,15 +3283,7 @@ int main() {
     } else {
         f_mkdir(HOME_DIR);
         f_load_conf();
-#if SOFTTV
-        graphics_set_tv(tv_system == 0, true); // applied by the next graphics_set_mode()
-#endif
-#if VGA || HDMI || SOFTTV
-        graphics_set_scale((enum graphics_scale_t)screen_scale);
-#endif
-#if BACKPLANE
-        apply_backplane();
-#endif
+        apply_video_settings();
     }
 
     bool browser_rom_preloaded = false;

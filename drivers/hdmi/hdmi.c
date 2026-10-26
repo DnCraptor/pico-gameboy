@@ -179,20 +179,28 @@ static void pio_set_x(PIO pio, const int sm, uint32_t v) {
 }
 
 
-/* 3x / stretched picture: the buffer row of every screen line, -1 - none */
+/* 3x / stretched picture (and 2x with gray lines): the buffer row of every
+ * screen line, -1 - none */
 static int16_t line_row[480];
 static int line_row_h = -1, line_row_scale = -1;
 static int stretch_k = 2; // stretch: whole samples per pixel
+
+/* gray lines: only the horizontal ones (a sample is 2 pixels wide); the grey
+ * is a colour of the text palette: black, dark grey, light grey, white */
+static volatile uint8_t gray_lines = 0;
+static volatile uint8_t gray_slot = 208;
+static const uint8_t gray_slots[4] = { 200, 208, 207, 215 };
 
 static void line_rows_update(void) {
     const int h = graphics_buffer_height;
     if (graphics_buffer_width > 0) stretch_k = SCREEN_WIDTH / graphics_buffer_width;
     if (h == line_row_h && (int)graphics_scale == line_row_scale) return;
-    const int top = (480 - 3 * h) / 2;
+    const int k = graphics_scale == GRAPHICS_SCALE_3X ? 3 : 2;
+    const int top = (480 - k * h) / 2;
     for (int t = 0; t < 480; t++) {
         const int r = t - top;
-        line_row[t] = graphics_scale == GRAPHICS_SCALE_3X ? (r < 0 || r >= 3 * h ? -1 : r / 3)
-                                                          : (int16_t)(t * h / 480);
+        line_row[t] = graphics_scale == GRAPHICS_SCALE_STRETCH ? (int16_t)(t * h / 480)
+                                                               : (r < 0 || r >= k * h ? -1 : r / k);
     }
     line_row_h = h;
     line_row_scale = (int)graphics_scale;
@@ -247,16 +255,19 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
      * independently of the game image's 2x/3x/Full scaling. */
     const bool overlay_row = overlay_enabled && graphics_mode == GRAPHICSMODE_DEFAULT &&
                              line < 480 && line + 1 >= OVERLAY_BAR_Y * 2;
+    const bool gray_h = graphics_scale != GRAPHICS_SCALE_STRETCH && (gray_lines & GRAPHICS_GRAY_HORIZONTAL);
     const bool per_line = graphics_mode == GRAPHICSMODE_DEFAULT &&
-                          graphics_scale != GRAPHICS_SCALE_2X && line < 479 && !overlay_row;
+                          (graphics_scale != GRAPHICS_SCALE_2X || gray_h) && line < 479 && !overlay_row;
     int scaled_row = -1;
+    bool gray_row = false; // the last screen line of a buffer row: grey
     if (per_line) {
         const int target = line + 1;
         scaled_row = line_row[target]; // no division here: RP2040 divides in the flash
         const int prev_row = line_row[target - 1];
+        gray_row = gray_h && scaled_row >= 0 && (target + 1 >= 480 || line_row[target + 1] != scaled_row);
         // line 0 always draws: the buffer before it is a blanking line
         // (the backplane changes on every second line)
-        if (line > 0 && scaled_row == prev_row && (!backplane_cells || (target & 1))) return;
+        if (line > 0 && scaled_row == prev_row && (!backplane_cells || (target & 1)) && !gray_row) return;
     } else if (!overlay_row && (line & 1) == 0) return;
 
     inx_buf_dma++;
@@ -291,13 +302,24 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
             } else {
                 const uint8_t* src = &graphics_buffer[scaled_row * graphics_buffer_width];
                 const int w = graphics_buffer_width;
-                // 3x: 1.5 output samples per pixel (each sample is 2 physical pixels)
-                const int out_w = graphics_scale == GRAPHICS_SCALE_3X ? w * 3 / 2 : SCREEN_WIDTH;
+                // 3x: 1.5 output samples per pixel (each sample is 2 physical pixels), 2x: 1
+                const int out_w = graphics_scale == GRAPHICS_SCALE_3X ? w * 3 / 2
+                                : graphics_scale == GRAPHICS_SCALE_2X ? w : SCREEN_WIDTH;
                 const int left = (SCREEN_WIDTH - out_w) / 2;
                 if (bp) irq_copy(output_buffer, bp, left);
                 else irq_fill(output_buffer, 255, left);
                 uint8_t* out = output_buffer + left;
-                if (graphics_scale == GRAPHICS_SCALE_3X) {
+                if (gray_row) {
+                    irq_fill(out, gray_slot, out_w);
+                    out += out_w;
+                }
+                else if (graphics_scale == GRAPHICS_SCALE_2X) {
+                    for (int x = 0; x < w; x++) {
+                        const uint8_t c = src[x];
+                        *out++ = ((c & 0xf0) == 0xf0) ? 255 : c;
+                    }
+                }
+                else if (graphics_scale == GRAPHICS_SCALE_3X) {
                     for (int x = 0; x + 1 < w; x += 2) {
                         uint8_t a = src[x], b = src[x + 1];
                         a = ((a & 0xf0) == 0xf0) ? 255 : a;
@@ -793,6 +815,11 @@ void graphics_set_offset(int x, int y) {
 void graphics_set_scale(enum graphics_scale_t scale) {
     graphics_scale = scale;
     line_rows_update();
+}
+
+void graphics_set_gray_lines(const uint8_t lines, const uint8_t level) {
+    gray_slot = gray_slots[level & 3u];
+    gray_lines = lines & GRAPHICS_GRAY_HORIZONTAL; // vertical: below the sample size
 }
 
 void graphics_set_textbuffer(uint8_t* buffer) {

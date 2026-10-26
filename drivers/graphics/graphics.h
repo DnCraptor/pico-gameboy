@@ -81,6 +81,14 @@ enum graphics_scale_t {
 };
 void graphics_set_scale(enum graphics_scale_t scale);
 
+/* VGA / HDMI, 2x and 3x: the gaps between the Game Boy pixels drawn in grey,
+ * like the grid of the real LCD.  lines: bit 0 - vertical gaps (VGA only:
+ * an HDMI sample is 2 pixels wide), bit 1 - horizontal ones; level 0..3 -
+ * black, dark grey, light grey, white. */
+#define GRAPHICS_GRAY_VERTICAL   1u
+#define GRAPHICS_GRAY_HORIZONTAL 2u
+void graphics_set_gray_lines(uint8_t lines, uint8_t level);
+
 /* HDMI / VGA / TV-SOFT: the Game Boy Color picture around the game (2x and
  * 3x; Full has none).  backplane_cells: 320x240 cells of 2x2 pixels of the
  * 640x480 screen (a TV field line is a cell row), video palette slots.

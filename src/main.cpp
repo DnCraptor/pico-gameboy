@@ -205,7 +205,8 @@ static bool demo_requested = false;
 static bool demo_advance_pending = false;
 static uint64_t demo_game_started_at = 0;
 static uint8_t demo_duration = 0;
-static uint8_t demo_name = 1;
+static uint8_t demo_name = 1;      // show ROM title during the first 10 seconds
+static uint8_t demo_timer_osd = 1; // keep the countdown visible for the entire demo
 static char demo_dir[256] = "";
 static char demo_current_name[80] = "";
 static constexpr uint16_t demo_seconds[] = {15, 30, 45, 60, 120, 180, 300, 600};
@@ -475,32 +476,45 @@ static void blend_slots_init() {
 static void demo_draw_title_overlay() {
     static unsigned last_seconds = 0xffffffffu;
     static bool last_show_title = false;
+    static bool last_show_timer = false;
     static bool visible = false;
+    static uint64_t last_game_started_at = 0;
 
     if (!demo_active || !demo_game_started_at) {
         if (visible) graphics_set_overlay(nullptr, false);
         visible = false;
         last_seconds = 0xffffffffu;
         last_show_title = false;
+        last_show_timer = false;
+        last_game_started_at = 0;
         return;
     }
 
     const uint8_t duration = demo_duration < count_of(demo_seconds) ? demo_duration : 0;
     const uint64_t total_us = (uint64_t)demo_seconds[duration] * 1000000ull;
     const uint64_t elapsed_us = time_us_64() - demo_game_started_at;
-    // Demo OSD is temporary, not a permanent black bar over game content.
-    // Like the Watara title, it has a ten-second introduction window.
-    if (elapsed_us >= 10000000ull) {
+    const uint64_t remain_us = elapsed_us < total_us ? total_us - elapsed_us : 0;
+    const unsigned seconds = (unsigned)((remain_us + 999999ull) / 1000000ull);
+    const bool show_title = demo_name && demo_current_name[0] && elapsed_us < 10000000ull;
+    const bool show_timer = demo_timer_osd != 0;
+
+    // The title and countdown are independent. No active component means
+    // no bar, but turning off the title never turns off the countdown.
+    if (!show_title && !show_timer) {
         if (visible) graphics_set_overlay(nullptr, false);
         visible = false;
         last_seconds = 0xffffffffu;
         last_show_title = false;
+        last_show_timer = false;
         return;
     }
-    const uint64_t remain_us = elapsed_us < total_us ? total_us - elapsed_us : 0;
-    const unsigned seconds = (unsigned)((remain_us + 999999ull) / 1000000ull);
-    const bool show_title = demo_name && demo_current_name[0];
-    if (visible && seconds == last_seconds && show_title == last_show_title) return;
+    if (last_game_started_at != demo_game_started_at) {
+        last_game_started_at = demo_game_started_at;
+        last_seconds = 0xffffffffu;
+    }
+    if (visible && seconds == last_seconds && show_title == last_show_title &&
+        show_timer == last_show_timer)
+        return;
 
     char label[53];
     if (show_title) {
@@ -511,7 +525,10 @@ static void demo_draw_title_overlay() {
         for (size_t i = 0; i < n; ++i)
             title[i] = demo_current_name[i] == '_' ? ' ' : demo_current_name[i];
         title[n] = '\0';
-        snprintf(label, sizeof label, "%s  %us", title, seconds);
+        if (show_timer)
+            snprintf(label, sizeof label, "%s  %us", title, seconds);
+        else
+            snprintf(label, sizeof label, "%s", title);
     } else {
         snprintf(label, sizeof label, "%us", seconds);
     }
@@ -519,17 +536,22 @@ static void demo_draw_title_overlay() {
     visible = true;
     last_seconds = seconds;
     last_show_title = show_title;
+    last_show_timer = show_timer;
 }
 #else
 /* TFT/legacy output has no scanout OSD: retain the original LCD fallback. */
 static void demo_overlay_line(const unsigned y, uint8_t* line) {
     if (!demo_active || y < LCD_HEIGHT - 8) return;
+    const uint64_t elapsed = time_us_64() - demo_game_started_at;
+    const bool show_title = demo_name && demo_current_name[0] && elapsed < 10000000ull;
+    const bool show_timer = demo_timer_osd != 0;
+    if (!show_title && !show_timer) return;
     static char label[27];
     if (y == LCD_HEIGHT - 8) {
-        const uint64_t elapsed = time_us_64() - demo_game_started_at;
-        const uint64_t length = (uint64_t)demo_seconds[demo_duration] * 1000000ull;
+        const uint8_t duration = demo_duration < count_of(demo_seconds) ? demo_duration : 0;
+        const uint64_t length = (uint64_t)demo_seconds[duration] * 1000000ull;
         const unsigned left = (unsigned)((elapsed < length ? (length - elapsed + 999999ull) : 0) / 1000000ull);
-        if (demo_name && elapsed < 10000000ull) {
+        if (show_title) {
             char title[19];
             unsigned n = 0;
             while (n + 1 < sizeof title && demo_current_name[n] && demo_current_name[n] != '.') {
@@ -538,9 +560,10 @@ static void demo_overlay_line(const unsigned y, uint8_t* line) {
                 n++;
             }
             title[n] = '\0';
-            snprintf(label, sizeof label, "%s %us", title, left);
+            if (show_timer) snprintf(label, sizeof label, "%s %us", title, left);
+            else snprintf(label, sizeof label, "%s", title);
         } else {
-            snprintf(label, sizeof label, "DEMO %us", left);
+            snprintf(label, sizeof label, "%us", left);
         }
     }
     memset(line, 193, LCD_WIDTH);
@@ -2497,15 +2520,17 @@ const MenuItem menu_items[] = {
         }
     },
     { "16 shades: %s", ARRAY, &palette16_select, nullptr, GB_PALETTES16_COUNT,
-      { "OFF", "GRAY", "RED", "ORANGE", "GREEN", "BLUE", "PURPLE",
-        "OGBP", "OGBR", "GBPR", "GBPO", "BPRO", "BROG", "PROG", "POGR", "ROGB", "ROGP" } },
+      { "OFF    ", "GRAY   ", "RED    ", "ORANGE ", "GREEN  ", "BLUE   ", "PURPLE ",
+        "OGBP   ", "OGBR   ", "GBPR   ", "GBPO   ", "BPRO   ", "BROG   ", "PROG   ",
+        "POGR   ", "ROGB   ", "ROGP   " } },
     { "Palette editor", PALETTE_EDITOR },
     { "", GAME_INI, nullptr, &game_ini_action },
     { "LCD ghosting: %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
     {},
     { "Demo time: %s", ARRAY, &demo_duration, nullptr, 7,
-      { "15 sec", "30 sec", "45 sec", "1 min", "2 min", "3 min", "5 min", "10 min" } },
-    { "Demo name: %s", ARRAY, &demo_name, nullptr, 1, { "OFF", "ON " } },
+      { "15 sec", "30 sec", "45 sec", "1 min ", "2 min ", "3 min ", "5 min ", "10 min" } },
+    { "Demo name OSD: %s", ARRAY, &demo_name, nullptr, 1, { "OFF", "ON " } },
+    { "Demo timer OSD: %s", ARRAY, &demo_timer_osd, nullptr, 1, { "OFF", "ON " } },
     { "Save state: %i", INT, &save_slot, &save, 8 },
     { "Load state: %i", INT, &save_slot, &load, 8 },
 #if SOFTTV
@@ -2555,6 +2580,7 @@ static void f_load_conf(void) {
             else if (!strcmp(line, "lcd_ghosting")) lcd_ghosting = d ? 1 : 0;
             else if (!strcmp(line, "demo_duration")) demo_duration = d < count_of(demo_seconds) ? (uint8_t)d : 0;
             else if (!strcmp(line, "demo_name")) demo_name = d ? 1 : 0;
+            else if (!strcmp(line, "demo_timer_osd")) demo_timer_osd = d ? 1 : 0;
             else if (!strcmp(line, "tv_system")) tv_system = d <= 1 ? (uint8_t)d : 0;
 #if BACKPLANE
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
@@ -2592,9 +2618,10 @@ static void f_save_conf(void) {
     config_path(pathname, sizeof pathname);
     static char text[512];
     palette16_global = palette16_select;
-    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\ndemo_duration=%u\r\ndemo_name=%u\r\n",
+    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\ndemo_duration=%u\r\ndemo_name=%u\r\ndemo_timer_osd=%u\r\n",
                        (unsigned)swap_ab, (unsigned)tv_system, (unsigned)screen_scale, (unsigned)palette_all,
-                       (unsigned)lcd_ghosting, (unsigned)demo_duration, (unsigned)demo_name);
+                       (unsigned)lcd_ghosting, (unsigned)demo_duration, (unsigned)demo_name,
+                       (unsigned)demo_timer_osd);
     for (unsigned i = 0; i < LAYER_COUNT && len > 0 && len < (int)sizeof text; i++)
         len += snprintf(text + len, sizeof text - len, "palette%u=%u\r\ncustom%u=%06lX,%06lX,%06lX,%06lX\r\n",
                         i, (unsigned)palette_index[i], i,

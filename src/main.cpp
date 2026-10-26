@@ -197,6 +197,18 @@ static uint32_t custom_rgb[LAYER_COUNT][4] = {
 };
 static bool game_ini_linked = false;
 static char rom_file[80] = "";      // the ROM file name, for the game palette
+
+/* ROM demonstration: same duration choices as pico-watara.  The playback
+ * directory is kept stable while the browser is opened with F10. */
+static bool demo_active = false;
+static bool demo_requested = false;
+static bool demo_advance_pending = false;
+static uint64_t demo_game_started_at = 0;
+static uint8_t demo_duration = 0;
+static uint8_t demo_name = 1;
+static char demo_dir[256] = "";
+static char demo_current_name[80] = "";
+static constexpr uint16_t demo_seconds[] = {15, 30, 45, 60, 120, 180, 300, 600};
 /* 0: legacy 4-shade palette; 1..16: exact 16-entry preset from the worksheet. */
 static uint8_t palette16_select = 0;
 static uint8_t palette16_global = 0;
@@ -457,6 +469,38 @@ static void blend_slots_init() {
     }
 }
 
+/* The indexed frame has spare entries 192 and 193: CGB uses 0..191.
+ * Draw the countdown on the frame that GB has finished, never on scanout. */
+static void demo_overlay_line(const unsigned y, uint8_t* line) {
+    if (!demo_active || y < LCD_HEIGHT - 8) return;
+    static char label[27];
+    if (y == LCD_HEIGHT - 8) {
+        const uint64_t elapsed = time_us_64() - demo_game_started_at;
+        const uint64_t length = (uint64_t)demo_seconds[demo_duration] * 1000000ull;
+        const unsigned left = (unsigned)((elapsed < length ? (length - elapsed + 999999ull) : 0) / 1000000ull);
+        if (demo_name && elapsed < 10000000ull) {
+            char title[19];
+            unsigned n = 0;
+            while (n + 1 < sizeof title && demo_current_name[n] && demo_current_name[n] != '.') {
+                const char c = demo_current_name[n];
+                title[n] = c == '_' ? ' ' : c;
+                n++;
+            }
+            title[n] = '\0';
+            snprintf(label, sizeof label, "%s %us", title, left);
+        } else {
+            snprintf(label, sizeof label, "DEMO %us", left);
+        }
+    }
+    memset(line, 193, LCD_WIDTH);
+    const unsigned font_row = y - (LCD_HEIGHT - 8);
+    for (unsigned x = 0; label[x] && x < LCD_WIDTH / 6; x++) {
+        const uint8_t bits = font_6x8[(uint8_t)label[x] * 8u + font_row];
+        for (unsigned b = 0; b < 6; b++)
+            if (bits & (1u << b)) line[x * 6 + b] = 192;
+    }
+}
+
 /* Game Boy Color palettes often change in the middle of a frame (the status
  * bar under the play field gets its own colours).  The buffers keep 8-bit
  * colour indices, and the video driver turns them into colours while it shows
@@ -538,6 +582,8 @@ void __time_critical_func(render_core)() {
     tuh_init(BOARD_TUH_RHPORT);
 #endif
     graphics_init();
+    graphics_set_palette(192, RGB888(255, 255, 255)); // Demo text
+    graphics_set_palette(193, RGB888(0, 0, 0));       // Demo label background
 
     const auto buffer = (uint8_t *)SCREEN;
     graphics_set_buffer(buffer, LCD_WIDTH, LCD_HEIGHT);
@@ -756,6 +802,7 @@ void __always_inline lcd_draw_line(struct gb_s* gb, const uint8_t pixels[160], c
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
             line[x] = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
     }
+    demo_overlay_line(y, line);
     if (y == LCD_HEIGHT - 1 && frame_started) {
         frame_started = false;
         if (gb->cgb.cgbMode) {
@@ -1020,6 +1067,53 @@ static void fb_remember(const char* dir, const char* name) {
     fb_focus[sizeof fb_focus - 1] = '\0';
 }
 
+/* The demo visits playable ROMs in the directory where it was launched.
+ * It chooses lexicographically, without heap allocation or a large list. */
+static bool demo_load_next_rom(const char* after) {
+    char cursor[80] = "";
+    if (after) snprintf(cursor, sizeof cursor, "%s", after);
+    while (true) {
+        DIR dir;
+        FILINFO info;
+        if (f_opendir(&dir, demo_dir) != FR_OK) return false;
+        char next[80] = "";
+        while (f_readdir(&dir, &info) == FR_OK && info.fname[0]) {
+            if (info.fattrib & AM_DIR) continue;
+            if (strlen(info.fname) >= sizeof next || !isExecutable(info.fname, "gbc,gb") ||
+                !rom_fits(info.fsize) || (cursor[0] && strcmp(info.fname, cursor) <= 0))
+                continue;
+            if (!next[0] || strcmp(info.fname, next) < 0)
+                snprintf(next, sizeof next, "%s", info.fname);
+        }
+        f_closedir(&dir);
+        if (!next[0]) return false;
+        char path[256];
+        if (snprintf(path, sizeof path, "%s\\%s", demo_dir, next) < (int)sizeof path &&
+            filebrowser_loadfile(path)) {
+            snprintf(demo_current_name, sizeof demo_current_name, "%s", next);
+            demo_game_started_at = time_us_64();
+            return true;
+        }
+        snprintf(cursor, sizeof cursor, "%s", next); // skip failed ROM
+    }
+}
+
+static bool demo_begin() {
+    snprintf(demo_dir, sizeof demo_dir, "%s", fb_dir);
+    demo_current_name[0] = '\0';
+    demo_active = true;
+    demo_advance_pending = false;
+    if (demo_load_next_rom(nullptr)) return true;
+    // A directory consisting of subdirectories cannot start a demo there;
+    // try the regular ROM root as well, without changing the browser's path.
+    if (strcmp(demo_dir, HOME_DIR) != 0) {
+        snprintf(demo_dir, sizeof demo_dir, "%s", HOME_DIR);
+        if (demo_load_next_rom(nullptr)) return true;
+    }
+    demo_active = false;
+    return false;
+}
+
 /* Returns when a ROM is ready to run: a newly loaded one (START) or the
  * previous one (SELECT). */
 static bool gbbp_try_install(const char* pathname); // a .gbbp file: install it as the backplane
@@ -1062,11 +1156,16 @@ void filebrowser(const char* executables) {
         auto off = 0;
         draw_text("START", off, 29, 7, 0);
         off += 5;
-        draw_text(" Run at cursor ", off, 29, 0, 3);
-        off += 16;
+        draw_text(" Run ", off, 29, 0, 3);
+        off += 5;
         draw_text("SELECT", off, 29, 7, 0);
         off += 6;
-        draw_text(" Run previous  ", off, 29, 0, 3);
+        draw_text(" Prev ", off, 29, 0, 3);
+        off += 6;
+        draw_text("B", off, 29, 7, 0);
+        off += 1;
+        draw_text(" Demo ", off, 29, 0, 3);
+        off += 6;
 #ifndef TFT
         off += 16;
         draw_text("ARROWS", off, 29, 7, 0);
@@ -1139,6 +1238,14 @@ void filebrowser(const char* executables) {
                     fb_canceled = true;
                     return;
                 }
+            }
+
+            // B starts Demo; the browser never tries to boot a ROM itself.
+            if (keys & BTN_B) {
+                fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
+                demo_requested = true;
+                fb_rom_ready = false;
+                return;
             }
 
             // SELECT: run the previous cartridge; START+SELECT: and open the menu (as in the game)
@@ -1310,6 +1417,7 @@ enum menu_type_e {
     SAVE,
     LOAD,
     ROM_SELECT,
+    START_DEMO,
     GAME_INI,
     PALETTE_EDITOR,
     RETURN,
@@ -2338,6 +2446,9 @@ const MenuItem menu_items[] = {
     { "", GAME_INI, nullptr, &game_ini_action },
     { "LCD ghosting: %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
     {},
+    { "Demo time: %s", ARRAY, &demo_duration, nullptr, 7,
+      { "15 sec", "30 sec", "45 sec", "1 min", "2 min", "3 min", "5 min", "10 min" } },
+    { "Demo name: %s", ARRAY, &demo_name, nullptr, 1, { "OFF", "ON " } },
     { "Save state: %i", INT, &save_slot, &save, 8 },
     { "Load state: %i", INT, &save_slot, &load, 8 },
 #if SOFTTV
@@ -2357,6 +2468,7 @@ const MenuItem menu_items[] = {
     { FREQ_STR(CPU_FREQ), "396", "404", "408", "412", "416", "420", "424", "432" }
 },
 { "Press START / Enter to apply", NONE },
+    { "Start Demo", START_DEMO },
     { "Reset to ROM select", ROM_SELECT },
     { "Return to game", RETURN }
 };
@@ -2384,6 +2496,8 @@ static void f_load_conf(void) {
             const unsigned long d = strtoul(val, nullptr, 10);
             if (!strcmp(line, "swap_ab")) swap_ab = d ? 1 : 0;
             else if (!strcmp(line, "lcd_ghosting")) lcd_ghosting = d ? 1 : 0;
+            else if (!strcmp(line, "demo_duration")) demo_duration = d < count_of(demo_seconds) ? (uint8_t)d : 0;
+            else if (!strcmp(line, "demo_name")) demo_name = d ? 1 : 0;
             else if (!strcmp(line, "tv_system")) tv_system = d <= 1 ? (uint8_t)d : 0;
 #if BACKPLANE
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
@@ -2421,9 +2535,9 @@ static void f_save_conf(void) {
     config_path(pathname, sizeof pathname);
     static char text[512];
     palette16_global = palette16_select;
-    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\n",
+    int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\ndemo_duration=%u\r\ndemo_name=%u\r\n",
                        (unsigned)swap_ab, (unsigned)tv_system, (unsigned)screen_scale, (unsigned)palette_all,
-                       (unsigned)lcd_ghosting);
+                       (unsigned)lcd_ghosting, (unsigned)demo_duration, (unsigned)demo_name);
     for (unsigned i = 0; i < LAYER_COUNT && len > 0 && len < (int)sizeof text; i++)
         len += snprintf(text + len, sizeof text - len, "palette%u=%u\r\ncustom%u=%06lX,%06lX,%06lX,%06lX\r\n",
                         i, (unsigned)palette_index[i], i,
@@ -2532,8 +2646,18 @@ void menu() {
                             exit = true;
                         break;
 
+                    case START_DEMO:
+                        if (activate) {
+                            demo_requested = true;
+                            demo_advance_pending = false;
+                            f_save_conf();
+                            restart = true;
+                            return;
+                        }
+                        break;
                     case ROM_SELECT:
                         if (activate) {
+                            demo_active = demo_requested = demo_advance_pending = false;
                             restart = true;
                             return;
                         }
@@ -2696,16 +2820,33 @@ int main() {
 
     bool browser_rom_preloaded = false;
     while (true) {
-        /* ROM File selector */
-        if (FR_OK == fr && !browser_rom_preloaded) {
+        /* The automatic demonstration advances without opening a browser.
+         * The regular F10 path sets browser_rom_preloaded for a manual ROM. */
+        bool demo_loaded = false;
+        if (demo_requested || (demo_active && demo_advance_pending))
+            graphics_set_mode(TEXTMODE_DEFAULT);
+        if (demo_requested) {
+            demo_requested = false;
+            demo_loaded = demo_begin();
+        } else if (demo_active && demo_advance_pending) {
+            demo_advance_pending = false;
+            demo_loaded = demo_load_next_rom(demo_current_name);
+            if (!demo_loaded) demo_loaded = demo_load_next_rom(nullptr); // wrap
+            if (!demo_loaded) demo_active = false;
+        }
+        if (FR_OK == fr && !browser_rom_preloaded && !demo_loaded) {
             graphics_set_mode(TEXTMODE_DEFAULT);
 #if BACKPLANE
             filebrowser("gbc,gb,gbbp"); // .gbbp: a backplane to install
 #else
             filebrowser("gbc,gb");
 #endif
-            graphics_set_mode(GRAPHICSMODE_DEFAULT);
+            if (demo_requested) { // B from the browser
+                demo_requested = false;
+                if (!demo_begin()) continue; // let the user choose another folder
+            }
         }
+        if (!browser_rom_preloaded || demo_loaded) graphics_set_mode(GRAPHICSMODE_DEFAULT);
         browser_rom_preloaded = false;
 
         /* Initialise GB context. */
@@ -2744,6 +2885,12 @@ int main() {
                 fb_can_cancel = true;
                 fb_canceled = false;
                 fb_rom_ready = false;
+                // Stop the demo clock while F10 has the screen and SD card.
+                const bool was_demo = demo_active;
+                const bool pending_demo = demo_advance_pending;
+                const uint64_t browser_started_at = time_us_64();
+                demo_active = false;
+                demo_advance_pending = false;
                 graphics_set_mode(TEXTMODE_DEFAULT);
 #if BACKPLANE
                 filebrowser("gbc,gb,gbbp");
@@ -2754,11 +2901,18 @@ int main() {
                 graphics_set_mode(GRAPHICSMODE_DEFAULT);
                 if (fb_canceled) {
                     fb_canceled = false;
+                    demo_active = was_demo;
+                    demo_advance_pending = pending_demo;
+                    if (was_demo && demo_game_started_at)
+                        demo_game_started_at += time_us_64() - browser_started_at;
                     // The browser writes into SCREEN; the next GB frame
                     // repaints it if SCREEN is currently the front buffer.
                     graphics_set_buffer((uint8_t *)frames[frame_front], LCD_WIDTH, LCD_HEIGHT);
                     game_gate.arm(); // don't pass the held browser keys to GB
                 } else {
+                    // A manually selected game must not inherit the Demo timer.
+                    demo_active = false;
+                    demo_advance_pending = false;
                     // Browser loaded the next cartridge, or requested Demo.
                     browser_rom_preloaded = fb_rom_ready;
                     restart = true;
@@ -2850,6 +3004,11 @@ int main() {
 #else
                 i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
 #endif
+            }
+            if (demo_active && time_us_64() - demo_game_started_at >=
+                               (uint64_t)demo_seconds[demo_duration] * 1000000ull) {
+                demo_advance_pending = true;
+                restart = true;
             }
         }
         restart = false;

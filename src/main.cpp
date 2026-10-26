@@ -252,9 +252,9 @@ static volatile bool kbd_home = false;
 static volatile bool kbd_end = false;
 static volatile int8_t kbd_hex_key = -1;     // a hex digit just pressed (palette editor)
 static volatile bool kbd_hex_mode = false;   // the palette editor is open: A-F, W, S are digits
-static volatile int8_t palette_layer_cycle_requested = 0; // F1..F3 (+Shift): +-(layer + 1)
-static volatile bool palette_shuffle_requested = false;         // F7
-static volatile bool palette_shuffle_requested_no_save = false; // F6
+static volatile uint8_t palette_layer_random_requested = 0;   // F1..F3: BG / OBJ0 / OBJ1
+static volatile bool palette_shuffle_requested = false;       // F7: generate + link to ROM
+static volatile bool palette_shuffle_requested_no_save = false; // F6: generate only
 static volatile bool palette_save_requested = false;            // F8
 static volatile bool palette_default_requested = false;         // F9
 static volatile bool palette_editor_requested = false;          // F12
@@ -317,15 +317,13 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
         fxPressedV = fxPressed;
     }
     else {
-        /* palette keys (as in pico-wonderswan): F1..F3 - the next palette of
-         * BG / OBJ0 / OBJ1 (with Shift - the previous one), F6 - shuffle,
-         * F7 - shuffle and save, F8 - save the colours for this game,
-         * F9 - all AUTO, F12 - the palette editor */
-        const bool shift = isInReport(report, HID_KEY_SHIFT_LEFT) || isInReport(report, HID_KEY_SHIFT_RIGHT);
+        /* F1..F3 regenerate BG / OBJ0 / OBJ1 separately; F6 regenerates all
+         * three, F7 regenerates and links them to the ROM, F8 links the
+         * currently displayed colours, F9 resets AUTO, F12 opens the editor. */
         static const uint8_t layer_keys[LAYER_COUNT] = { HID_KEY_F1, HID_KEY_F2, HID_KEY_F3 };
-        for (int8_t layer = 0; layer < LAYER_COUNT; layer++)
+        for (uint8_t layer = 0; layer < LAYER_COUNT; layer++)
             if (isInReport(report, layer_keys[layer]) && !isInReport(prev_report, layer_keys[layer]))
-                palette_layer_cycle_requested = shift ? -(layer + 1) : layer + 1;
+                palette_layer_random_requested = layer + 1;
         if (isInReport(report, HID_KEY_F6) && !isInReport(prev_report, HID_KEY_F6))
             palette_shuffle_requested_no_save = true;
         if (isInReport(report, HID_KEY_F7) && !isInReport(prev_report, HID_KEY_F7))
@@ -1527,28 +1525,27 @@ static bool gbbp_try_install(const char*) { return false; }
 #define TEXT_BUFFER_COLS TEXTMODE_COLS
 #endif
 
-static const uint32_t preset_rgb0[] = {
-    0xD4FFFD, 0xD4FFF3, 0xFFE9FA, 0xE9E9FF, 0xE9FAFF, 0xE9FFF4,
-    0xF5FFE9, 0xFFF8E9, 0xFFF2F0, 0xD4FFDA, 0xEDFFD4
+static const uint32_t palette_color_pool[][4] = {
+    // B: background, C: sprite 0, D: sprite 1, E: border.
+    // Warm: Red + Orange (6 entries)
+    {0xFFF1F1, 0xFF6A6A, 0xB71919, 0x750909},
+    {0xFFD6D6, 0xFF5353, 0x950E0E, 0x560202},
+    {0xFFBEBE, 0xEF3C3C, 0x7F0404, 0x3F0101},
+    {0xFFFBF1, 0xDBA30F, 0x926A00, 0x0C0422},
+    {0xFDEFCA, 0xC69209, 0x846208, 0x5B4202},
+    {0xFFD871, 0xB58504, 0x755707, 0x443100},
+    // Cold: Green + Blue + Purple (9 entries)
+    {0xF1FFF8, 0x41E291, 0x1C9E5C, 0x0E6439},
+    {0xC3FFE1, 0x2ACD7B, 0x159051, 0x085B32},
+    {0x86F8BF, 0x27BB70, 0x15824C, 0x04361D},
+    {0xF1FCFF, 0x72DCF6, 0x2AA1C0, 0x127088},
+    {0xCFF5FF, 0x56CAE7, 0x2493B0, 0x0A5062},
+    {0xB5F0FF, 0x44BDDB, 0x1E8AA6, 0x03232C},
+    {0xEBEEF4, 0x89A1CC, 0x2A5EBC, 0x0D388B},
+    {0xD3D9E5, 0x6B8DCA, 0x2355B0, 0x042460},
+    {0xC9D2E3, 0x4C79C9, 0x1B489C, 0x011334},
 };
-static const uint32_t preset_rgb1[] = {
-    // Cold (B4:G4), then warm (H4:N4).
-    0x92F937, 0x37F992, 0x37F9D9, 0x37D9F9, 0x62BAC7, 0xC0CBD5,
-    0xE29BE2, 0xBDC762, 0xF79036, 0xFF8000, 0xD2F937, 0xE29BB7,
-    0xE0A3F1
-};
-static const uint32_t preset_rgb2[] = {
-    // Cold (B5:G5), then warm (H5:N5).
-    0x139566, 0x349BC0, 0x009999, 0x319413, 0x9039D2, 0x137294,
-    0xCD3476, 0xCD34B8, 0x909413, 0xD58B41, 0xD8C835, 0xC339A5,
-    0xE07100
-};
-static const uint32_t preset_rgb3[] = {
-    0x6C6800, 0x6B0400, 0x366C00, 0x006C48, 0x00686C, 0x00326C,
-    0x04006C, 0x44006C, 0x6C0044, 0x6C0004, 0x000000
-};
-static constexpr uint8_t RANDOM_RGB1_COLD_COUNT = 6; // B4:G4
-static constexpr uint8_t RANDOM_RGB2_COLD_COUNT = 6; // B5:G5
+static constexpr uint8_t PALETTE_WARM_COUNT = 6;
 
 static uint32_t rgb565_to_rgb888(const uint16_t c) {
     const uint32_t r = c >> 11 & 31, g = c >> 5 & 63, b = c & 31;
@@ -1591,21 +1588,24 @@ static uint32_t palette_random_next() {
     return palette_random_state;
 }
 
-/* Random as in pico-gamate: shades from the light / middle / dark lists, the
- * second middle one of the opposite temperature */
+/* Select a colour from the opposite-temperature part of the spreadsheet. */
+static unsigned palette_opposite_index(const unsigned index) {
+    if (index < PALETTE_WARM_COUNT)
+        return PALETTE_WARM_COUNT +
+               palette_random_next() % (count_of(palette_color_pool) - PALETTE_WARM_COUNT);
+    return palette_random_next() % PALETTE_WARM_COUNT;
+}
+
+/* A 4-colour DMG palette: background and border have opposite temperatures;
+ * OBJ0 and OBJ1 also have opposite temperatures, independently of BG. */
 static void randomize_layer(const unsigned layer) {
     uint32_t* const c = random_rgb[layer];
-    c[0] = preset_rgb0[palette_random_next() % count_of(preset_rgb0)];
-    const uint8_t i1 = palette_random_next() % count_of(preset_rgb1);
-    c[1] = preset_rgb1[i1];
-    if (i1 < RANDOM_RGB1_COLD_COUNT) {
-        const uint8_t warm_count = count_of(preset_rgb2) - RANDOM_RGB2_COLD_COUNT;
-        c[2] = preset_rgb2[RANDOM_RGB2_COLD_COUNT + palette_random_next() % warm_count];
-    }
-    else {
-        c[2] = preset_rgb2[palette_random_next() % RANDOM_RGB2_COLD_COUNT];
-    }
-    c[3] = preset_rgb3[palette_random_next() % count_of(preset_rgb3)];
+    const unsigned background = palette_random_next() % count_of(palette_color_pool);
+    const unsigned sprite0 = palette_random_next() % count_of(palette_color_pool);
+    c[0] = palette_color_pool[background][0];
+    c[1] = palette_color_pool[sprite0][1];
+    c[2] = palette_color_pool[palette_opposite_index(sprite0)][2];
+    c[3] = palette_color_pool[palette_opposite_index(background)][3];
 }
 
 /* the selector a palette follows */
@@ -2000,45 +2000,38 @@ static void palette_editor(const bool from_menu) {
 
 /* keys pressed in the ROM browser or in the menu are not for the game */
 static void palette_hotkeys_clear() {
-    palette_layer_cycle_requested = 0;
+    palette_layer_random_requested = 0;
     palette_shuffle_requested = palette_shuffle_requested_no_save = false;
     palette_save_requested = palette_default_requested = palette_editor_requested = false;
 }
 
-/* F1..F3 (+Shift), F6, F7, F8, F9, F12 - see process_kbd_report();
+/* F1..F3, F6, F7, F8, F9, F12 - see process_kbd_report();
  * returns true after the palette editor (keys may still be held) */
 static bool handle_palette_hotkeys() {
-    const int8_t cycle = palette_layer_cycle_requested;
+    const uint8_t random_layer = palette_layer_random_requested;
     const bool shuffle = palette_shuffle_requested;
     const bool shuffle_no_save = palette_shuffle_requested_no_save;
     const bool save_game = palette_save_requested;
     const bool to_default = palette_default_requested;
     const bool editor = palette_editor_requested;
-    palette_layer_cycle_requested = 0;
+    palette_layer_random_requested = 0;
     palette_shuffle_requested = palette_shuffle_requested_no_save = false;
     palette_save_requested = palette_default_requested = palette_editor_requested = false;
     if (gb.cgb.cgbMode) return false; // a Game Boy Color game has its own colours
 
-    if (cycle) {
-        const unsigned layer = (cycle < 0 ? -cycle : cycle) - 1;
-        if (layer < LAYER_COUNT) {
-            palette_split();
-            uint8_t& sel = palette_index[layer];
-            sel = cycle < 0 ? (sel + PALETTE_CUSTOM) % (PALETTE_CUSTOM + 1) : (sel + 1) % (PALETTE_CUSTOM + 1);
-            if (sel == PALETTE_RANDOM) randomize_layer(layer);
-            update_palette();
-            f_save_conf();
-        }
+    if (random_layer > 0 && random_layer <= LAYER_COUNT) {
+        const unsigned layer = random_layer - 1;
+        palette_split();
+        palette_index[layer] = PALETTE_RANDOM;
+        randomize_layer(layer);
+        update_palette();
     }
     if (shuffle || shuffle_no_save) {
-        palette_all = PALETTE_CUSTOM;
-        for (unsigned layer = 0; layer < LAYER_COUNT; layer++)
-            palette_index[layer] = palette_random_next() % (PALETTE_CUSTOM + 1);
+        palette_all = PALETTE_RANDOM;
         randomize_random_layers();
         update_palette();
-        if (shuffle) f_save_conf();
     }
-    if (save_game && write_game_palette_ini())
+    if ((shuffle || save_game) && write_game_palette_ini())
         game_ini_linked = true;
     if (to_default) {
         palette_all = PALETTE_AUTO;
@@ -2059,18 +2052,18 @@ const MenuItem menu_items[] = {
     { "Palette:      %s", ARRAY, &palette_all, nullptr, PALETTE_CUSTOM,
         {
             "AUTO (by game)   ",
-            "1 - yellow-red   ",
-            "2 - orange       ",
-            "3 - negative     ",
-            "4 - dark green   ",
-            "5 - red          ",
-            "6 - pink         ",
-            "7 - green        ",
-            "8 - dark blue    ",
-            "9 - pastel       ",
-            "10 - blue        ",
-            "11 - yellow      ",
-            "12 - DMG         ",
+            "YELLOW-RED       ",
+            "ORANGE           ",
+            "NEGATIVE         ",
+            "DARK GREEN       ",
+            "RED              ",
+            "PINK             ",
+            "GREEN            ",
+            "DARK BLUE        ",
+            "PASTEL           ",
+            "BLUE             ",
+            "YELLOW           ",
+            "DMG              ",
             "GAMATE DEFAULT   ",
             "BLACK & WHITE    ",
             "BGB              ",
@@ -2112,18 +2105,18 @@ const MenuItem menu_items[] = {
     { "  BG:         %s", ARRAY, &palette_index[LAYER_BG], nullptr, PALETTE_CUSTOM,
         {
             "AUTO (by game)   ",
-            "1 - yellow-red   ",
-            "2 - orange       ",
-            "3 - negative     ",
-            "4 - dark green   ",
-            "5 - red          ",
-            "6 - pink         ",
-            "7 - green        ",
-            "8 - dark blue    ",
-            "9 - pastel       ",
-            "10 - blue        ",
-            "11 - yellow      ",
-            "12 - DMG         ",
+            "YELLOW-RED       ",
+            "ORANGE           ",
+            "NEGATIVE         ",
+            "DARK GREEN       ",
+            "RED              ",
+            "PINK             ",
+            "GREEN            ",
+            "DARK BLUE        ",
+            "PASTEL           ",
+            "BLUE             ",
+            "YELLOW           ",
+            "DMG              ",
             "GAMATE DEFAULT   ",
             "BLACK & WHITE    ",
             "BGB              ",
@@ -2165,18 +2158,18 @@ const MenuItem menu_items[] = {
     { "  OBJ0:       %s", ARRAY, &palette_index[LAYER_OBJ0], nullptr, PALETTE_CUSTOM,
         {
             "AUTO (by game)   ",
-            "1 - yellow-red   ",
-            "2 - orange       ",
-            "3 - negative     ",
-            "4 - dark green   ",
-            "5 - red          ",
-            "6 - pink         ",
-            "7 - green        ",
-            "8 - dark blue    ",
-            "9 - pastel       ",
-            "10 - blue        ",
-            "11 - yellow      ",
-            "12 - DMG         ",
+            "YELLOW-RED       ",
+            "ORANGE           ",
+            "NEGATIVE         ",
+            "DARK GREEN       ",
+            "RED              ",
+            "PINK             ",
+            "GREEN            ",
+            "DARK BLUE        ",
+            "PASTEL           ",
+            "BLUE             ",
+            "YELLOW           ",
+            "DMG              ",
             "GAMATE DEFAULT   ",
             "BLACK & WHITE    ",
             "BGB              ",
@@ -2218,18 +2211,18 @@ const MenuItem menu_items[] = {
     { "  OBJ1:       %s", ARRAY, &palette_index[LAYER_OBJ1], nullptr, PALETTE_CUSTOM,
         {
             "AUTO (by game)   ",
-            "1 - yellow-red   ",
-            "2 - orange       ",
-            "3 - negative     ",
-            "4 - dark green   ",
-            "5 - red          ",
-            "6 - pink         ",
-            "7 - green        ",
-            "8 - dark blue    ",
-            "9 - pastel       ",
-            "10 - blue        ",
-            "11 - yellow      ",
-            "12 - DMG         ",
+            "YELLOW-RED       ",
+            "ORANGE           ",
+            "NEGATIVE         ",
+            "DARK GREEN       ",
+            "RED              ",
+            "PINK             ",
+            "GREEN            ",
+            "DARK BLUE        ",
+            "PASTEL           ",
+            "BLUE             ",
+            "YELLOW           ",
+            "DMG              ",
             "GAMATE DEFAULT   ",
             "BLACK & WHITE    ",
             "BGB              ",

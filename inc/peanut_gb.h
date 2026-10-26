@@ -1172,6 +1172,8 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			if (!lcd_enabled && (val & LCDC_ENABLE))
 			{
 				gb->lcd_blank = 1;
+				/* The counter was also used to advance time with LCD off. */
+				gb->counter.lcd_count = 0;
 			}
 			/* Check if LCD is being switched off. */
 			else if (lcd_enabled && !(val & LCDC_ENABLE))
@@ -2819,15 +2821,6 @@ void __gb_step_cpu(struct gb_s *gb)
 		/* TODO: Emulate HALT bug? */
 		gb->gb_halt = 1;
 
-		if (gb->hram_io[IO_IE] == 0)
-		{
-			/* Return program counter where this halt forever state started. */
-			/* This may be intentional, but this is required to stop an infinite
-			 * loop. */
-			(gb->gb_error)(gb, GB_HALT_FOREVER, gb->cpu_reg.pc.reg - 1);
-			PGB_UNREACHABLE();
-		}
-
 		if(gb->hram_io[IO_SC] & SERIAL_SC_TX_START)
 		{
 			int serial_cycles = SERIAL_CYCLES -
@@ -2877,6 +2870,12 @@ void __gb_step_cpu(struct gb_s *gb)
 
 			if(lcd_cycles < halt_cycles)
 				halt_cycles = lcd_cycles;
+		}
+		else if (halt_cycles > LCD_LINE_CYCLES)
+		{
+			/* With LCD off, the HALT fast-forward still needs bounded
+			 * steps for DIV/TIMA/serial and a responsive host frame. */
+			halt_cycles = LCD_LINE_CYCLES;
 		}
 
 		/* Some halt cycles may already be very high, so make sure we
@@ -3725,10 +3724,27 @@ void __gb_step_cpu(struct gb_s *gb)
 			}
 		}
 
-		/* If LCD is off, don't update LCD state or increase the LCD
-		 * ticks. */
+		/* With LCD disabled there is no VBlank, but CPU, timer and serial
+		 * clocks continue.  Produce a host frame every 154 * 456 LCD clocks
+		 * so gb_run_frame() cannot trap the input/menu loop forever.
+		 * lcd_count is otherwise idle until LCDC is enabled again. */
 		if(!(gb->hram_io[IO_LCDC] & LCDC_ENABLE))
+		{
+#if PEANUT_FULL_GBC_SUPPORT
+			if (inst_cycles > 1)
+				gb->counter.lcd_count += (inst_cycles >> gb->cgb.doubleSpeed);
+			else
+#endif
+			gb->counter.lcd_count += inst_cycles;
+			if (gb->counter.lcd_count >= LCD_LINE_CYCLES * LCD_VERT_LINES)
+			{
+				gb->counter.lcd_count -= LCD_LINE_CYCLES * LCD_VERT_LINES;
+				gb->gb_frame = 1;
+				/* Leave the internal HALT acceleration loop as well. */
+				if (gb->gb_halt) break;
+			}
 			continue;
+		}
 
 		/* LCD Timing */
 #if PEANUT_FULL_GBC_SUPPORT
@@ -3789,6 +3805,9 @@ void __gb_step_cpu(struct gb_s *gb)
 						!gb->display.interlace_count;
 				}
 #endif
+				/* HALT with IE=0 must not trap the host frame loop.
+				 * This is the same VBlank escape used by upstream Peanut-GB. */
+				if (gb->gb_halt && !gb->hram_io[IO_IE]) break;
 			}
 			/* Normal Line */
 			else if(gb->hram_io[IO_LY] < LCD_HEIGHT)

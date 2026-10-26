@@ -1846,8 +1846,8 @@ static uint8_t replay_begin_frame(const uint8_t physical_input) {
 static void replay_end_frame() {
     if (replay_mode == REPLAY_OFF) return;
     ++replay_frame;
-    if (replay_mode == REPLAY_RECORD && replay_frame % 60u == 0u && !replay_checkpoint())
-        replay_stop();
+    // Do not seek into the header or force an SD sync from the frame loop.
+    // replay_checkpoint() is still called on Save State, rollback and stop.
 }
 static replay_state_t replay_make_state() {
     replay_state_t state = {};

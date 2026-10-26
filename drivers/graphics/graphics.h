@@ -56,6 +56,16 @@ void graphics_set_mode(enum graphics_mode_t mode);
 
 void graphics_set_buffer(uint8_t* buffer, uint16_t width, uint16_t height);
 
+#if VGA || HDMI || SOFTTV
+/* Bottom-of-screen Demo OSD, drawn by scanout (not into the game frame).
+ * 255 is the black screen border (graphics_set_bgcolor), 215 is an existing
+ * high-contrast colour (white on HDMI/TV, bright on VGA).  Backplane owns
+ * 192..199 and 216..239: never overwrite those palette slots for OSD. */
+#define GRAPHICS_OSD_BG 255u
+#define GRAPHICS_OSD_FG 215u
+void graphics_set_overlay(const char* text, bool enabled);
+#endif
+
 /* HDMI / VGA / TV: counts the ends of the picture (once per field).  A buffer
  * set right after it (before the vertical blank is over) is shown whole from
  * the next field; the palette entries changed then apply to it alone. */

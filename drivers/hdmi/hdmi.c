@@ -35,6 +35,14 @@ static int graphics_buffer_shift_y = 0;
 static volatile enum graphics_scale_t graphics_scale = GRAPHICS_SCALE_2X;
 volatile uint32_t graphics_frame_count = 0;
 
+#define OVERLAY_BAR_Y 228
+#define OVERLAY_TEXT_Y 230
+#define OVERLAY_TEXT_MAX 52
+static char overlay_text[2][OVERLAY_TEXT_MAX + 1];
+static uint8_t overlay_text_len[2];
+static volatile uint8_t overlay_text_index = 0;
+static volatile bool overlay_enabled = false;
+
 //текстовый буфер
 uint8_t* text_buffer = NULL;
 
@@ -234,8 +242,13 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
      * buffer filled now is shown from the next line, so it is prepared for
      * line + 1, and kept (no inx_buf_dma++) while the source row repeats. */
     /* (the blanking lines keep the usual every-second-line rhythm) */
+    /* The HDMI DMA line filled now is displayed on physical line+1.
+     * The OSD starts at line 456 and covers the final 24 active lines,
+     * independently of the game image's 2x/3x/Full scaling. */
+    const bool overlay_row = overlay_enabled && graphics_mode == GRAPHICSMODE_DEFAULT &&
+                             line < 480 && line + 1 >= OVERLAY_BAR_Y * 2;
     const bool per_line = graphics_mode == GRAPHICSMODE_DEFAULT &&
-                          graphics_scale != GRAPHICS_SCALE_2X && line < 479;
+                          graphics_scale != GRAPHICS_SCALE_2X && line < 479 && !overlay_row;
     int scaled_row = -1;
     if (per_line) {
         const int target = line + 1;
@@ -244,7 +257,7 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
         // line 0 always draws: the buffer before it is a blanking line
         // (the backplane changes on every second line)
         if (line > 0 && scaled_row == prev_row && (!backplane_cells || (target & 1))) return;
-    } else if ((line & 1) == 0) return;
+    } else if (!overlay_row && (line & 1) == 0) return;
 
     inx_buf_dma++;
 
@@ -255,7 +268,21 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
         //область изображения
         uint8_t* output_buffer = activ_buf + 72; //для выравнивания синхры;
 
-        if (per_line) {
+        if (overlay_row) {
+            const int y = (line + 1) >> 1;
+            irq_fill(output_buffer, GRAPHICS_OSD_BG, SCREEN_WIDTH);
+            if (y >= OVERLAY_TEXT_Y && y < OVERLAY_TEXT_Y + 8) {
+                const uint8_t index = overlay_text_index;
+                const char* const str = overlay_text[index];
+                const int len = overlay_text_len[index];
+                const int x0 = (SCREEN_WIDTH - len * 6) / 2;
+                for (int c = 0; c < len; ++c) {
+                    uint8_t bits = font_6x8[(uint8_t)str[c] * 8 + (y - OVERLAY_TEXT_Y)];
+                    for (int x = 0; x < 6; ++x, bits >>= 1)
+                        if (bits & 1) output_buffer[x0 + c * 6 + x] = GRAPHICS_OSD_FG;
+                }
+            }
+        } else if (per_line) {
             // the backplane cell row of the line the buffer is shown on
             const uint8_t* bp = backplane_cells ? backplane_cells + ((line + 1) >> 1) * BACKPLANE_W : NULL;
             if (scaled_row < 0) {
@@ -673,6 +700,20 @@ static inline bool hdmi_init() {
     return true;
 };
 //выбор видеорежима
+void graphics_set_overlay(const char* text, bool enabled) {
+    if (enabled && text) {
+        const uint8_t next = overlay_text_index ^ 1u;
+        strncpy(overlay_text[next], text, OVERLAY_TEXT_MAX);
+        overlay_text[next][OVERLAY_TEXT_MAX] = '\0';
+        uint8_t len = 0;
+        while (len < OVERLAY_TEXT_MAX && overlay_text[next][len]) ++len;
+        overlay_text_len[next] = len;
+        __asm volatile ("dmb" ::: "memory");
+        overlay_text_index = next;
+    }
+    __asm volatile ("dmb" ::: "memory");
+    overlay_enabled = enabled;
+}
 inline void graphics_set_mode(enum graphics_mode_t mode) {
     graphics_mode = mode;
     clrScr(0);

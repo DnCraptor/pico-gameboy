@@ -95,6 +95,14 @@ static uint text_buffer_height = 0;
 
 static uint16_t txt_palette[16];
 
+#define OVERLAY_BAR_Y 228
+#define OVERLAY_TEXT_Y 230
+#define OVERLAY_TEXT_MAX 52
+static char overlay_text[2][OVERLAY_TEXT_MAX + 1];
+static uint8_t overlay_text_len[2];
+static volatile uint8_t overlay_text_index = 0;
+static volatile bool overlay_enabled = false;
+
 //буфер 2К текстовой палитры для быстрой работы
 static uint16_t* txt_palette_fast = NULL;
 //static uint16_t txt_palette_fast[256*4];
@@ -146,6 +154,27 @@ void __time_critical_func() dma_handler_VGA() {
     int y, line_number;
 
     uint32_t* * output_buffer = &lines_pattern[2 + (screen_line & 1)];
+
+    const int overlay_y = screen_line >> 1;
+    if (overlay_enabled && graphics_mode == GRAPHICSMODE_DEFAULT && overlay_y >= OVERLAY_BAR_Y) {
+        if (screen_line & 1) return;
+        uint16_t* const dst = (uint16_t*)((uint8_t*)*output_buffer + shift_picture);
+        const uint16_t bg = palette[0][GRAPHICS_OSD_BG], fg = palette[0][GRAPHICS_OSD_FG];
+        for (int x = 0; x < visible_line_size; ++x) dst[x] = bg;
+        if (overlay_y >= OVERLAY_TEXT_Y && overlay_y < OVERLAY_TEXT_Y + 8) {
+            const uint8_t index = overlay_text_index;
+            const char* const str = overlay_text[index];
+            const int len = overlay_text_len[index];
+            const int x0 = (visible_line_size - len * 6) / 2;
+            for (int c = 0; c < len; ++c) {
+                uint8_t bits = font_6x8[(uint8_t)str[c] * 8 + (overlay_y - OVERLAY_TEXT_Y)];
+                for (int x = 0; x < 6; ++x, bits >>= 1)
+                    if (bits & 1) dst[x0 + c * 6 + x] = fg;
+            }
+        }
+        dma_channel_set_read_addr(dma_chan_ctrl, output_buffer, false);
+        return;
+    }
 
     if (graphics_mode == GRAPHICSMODE_DEFAULT) {
         /* Game Boy picture on 640x480: 2x, 3x or stretched to the whole screen.
@@ -379,6 +408,20 @@ void __time_critical_func() dma_handler_VGA() {
     dma_channel_set_read_addr(dma_chan_ctrl, output_buffer, false);
 }
 
+void graphics_set_overlay(const char* text, bool enabled) {
+    if (enabled && text) {
+        const uint8_t next = overlay_text_index ^ 1u;
+        strncpy(overlay_text[next], text, OVERLAY_TEXT_MAX);
+        overlay_text[next][OVERLAY_TEXT_MAX] = '\0';
+        uint8_t len = 0;
+        while (len < OVERLAY_TEXT_MAX && overlay_text[next][len]) ++len;
+        overlay_text_len[next] = len;
+        __asm volatile ("dmb" ::: "memory");
+        overlay_text_index = next;
+    }
+    __asm volatile ("dmb" ::: "memory");
+    overlay_enabled = enabled;
+}
 void graphics_set_mode(enum graphics_mode_t mode) {
     switch (mode) {
         case TEXTMODE_53x30:

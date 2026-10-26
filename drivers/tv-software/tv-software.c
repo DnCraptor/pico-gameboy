@@ -93,6 +93,14 @@ static TV_MODE video_mode = {
     .LVL_BLACK = 0,
     .LVL_Y_MAX = 0,
 };
+#define OVERLAY_BAR_Y 228
+#define OVERLAY_TEXT_Y 230
+#define OVERLAY_TEXT_MAX 52
+static char overlay_text[2][OVERLAY_TEXT_MAX + 1];
+static uint8_t overlay_text_len[2];
+static volatile uint8_t overlay_text_index = 0;
+static volatile bool overlay_enabled = false;
+
 
 
 // text columns that fit into the active part of the current TV line
@@ -1052,7 +1060,31 @@ static bool __time_critical_func(video_timer_callbackTV)(repeating_timer_t* rt) 
                 // graphics_buffer.shift_y = graphics_buffer.shift_y > 8 ? graphics_buffer.shift_y - 8 : 0;
                 // graphics_buffer.shift_y =0;
                 if (input_buffer != NULL)
-                    switch (tv_out_mode.mode_bpp) {
+                    if (overlay_enabled && tv_out_mode.mode_bpp == GRAPHICSMODE_DEFAULT &&
+                        y >= OVERLAY_BAR_Y) {
+                        const int out_width = video_mode.img_W - d_end;
+                        const int x_shift = buffer_shift;
+                        uint8_t* const out = output_buffer8 + x_shift;
+                        const uint32_t bg = conv_color[li][GRAPHICS_OSD_BG];
+                        const uint8_t* const bg_bytes = (const uint8_t*)&bg;
+                        for (int x = 0; x < out_width; ++x) out[x] = bg_bytes[x & 3];
+                        if (y >= OVERLAY_TEXT_Y && y < OVERLAY_TEXT_Y + 8) {
+                            const uint8_t index = overlay_text_index;
+                            const char* const str = overlay_text[index];
+                            int n = overlay_text_len[index];
+                            if (n > out_width / 18) n = out_width / 18;
+                            const int x0 = (out_width - n * 18) / 2;
+                            for (int c = 0; c < n; ++c) {
+                                uint8_t bits = font_6x8[(uint8_t)str[c] * 8 + (y - OVERLAY_TEXT_Y)];
+                                for (int col = 0; col < 6; ++col, bits >>= 1) {
+                                    const uint32_t pixel = conv_color[li][(bits & 1) ? GRAPHICS_OSD_FG : GRAPHICS_OSD_BG];
+                                    const uint8_t* const px = (const uint8_t*)&pixel;
+                                    const int dest = x0 + c * 18 + col * 3;
+                                    for (int k = 0; k < 3; ++k) out[dest + k] = px[(dest + k) & 3];
+                                }
+                            }
+                        }
+                    } else switch (tv_out_mode.mode_bpp) {
                         case TEXTMODE_DEFAULT: {
                             const int cols = getCols(); // text buffer stride
                             int draw_cols = cols;       // guard: the line may still be in the previous TV mode
@@ -1191,6 +1223,20 @@ static bool __time_critical_func(video_timer_callbackTV)(repeating_timer_t* rt) 
     return true;
 }
 
+void graphics_set_overlay(const char* text, bool enabled) {
+    if (enabled && text) {
+        const uint8_t next = overlay_text_index ^ 1u;
+        strncpy(overlay_text[next], text, OVERLAY_TEXT_MAX);
+        overlay_text[next][OVERLAY_TEXT_MAX] = '\0';
+        uint8_t len = 0;
+        while (len < OVERLAY_TEXT_MAX && overlay_text[next][len]) ++len;
+        overlay_text_len[next] = len;
+        __asm volatile ("dmb" ::: "memory");
+        overlay_text_index = next;
+    }
+    __asm volatile ("dmb" ::: "memory");
+    overlay_enabled = enabled;
+}
 void graphics_set_buffer(uint8_t* buffer, const uint16_t width, const uint16_t height) {
     graphics_buffer.data = buffer;
     graphics_buffer.width = width;

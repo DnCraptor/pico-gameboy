@@ -469,8 +469,59 @@ static void blend_slots_init() {
     }
 }
 
-/* The indexed frame has spare entries 192 and 193: CGB uses 0..191.
- * Draw the countdown on the frame that GB has finished, never on scanout. */
+#if VGA || HDMI || SOFTTV
+/* Watara-style OSD: the scanout driver owns the bottom 12 screen lines.
+ * A double-buffered string can be updated from core 0 during gameplay. */
+static void demo_draw_title_overlay() {
+    static unsigned last_seconds = 0xffffffffu;
+    static bool last_show_title = false;
+    static bool visible = false;
+
+    if (!demo_active || !demo_game_started_at) {
+        if (visible) graphics_set_overlay(nullptr, false);
+        visible = false;
+        last_seconds = 0xffffffffu;
+        last_show_title = false;
+        return;
+    }
+
+    const uint8_t duration = demo_duration < count_of(demo_seconds) ? demo_duration : 0;
+    const uint64_t total_us = (uint64_t)demo_seconds[duration] * 1000000ull;
+    const uint64_t elapsed_us = time_us_64() - demo_game_started_at;
+    // Demo OSD is temporary, not a permanent black bar over game content.
+    // Like the Watara title, it has a ten-second introduction window.
+    if (elapsed_us >= 10000000ull) {
+        if (visible) graphics_set_overlay(nullptr, false);
+        visible = false;
+        last_seconds = 0xffffffffu;
+        last_show_title = false;
+        return;
+    }
+    const uint64_t remain_us = elapsed_us < total_us ? total_us - elapsed_us : 0;
+    const unsigned seconds = (unsigned)((remain_us + 999999ull) / 1000000ull);
+    const bool show_title = demo_name && demo_current_name[0];
+    if (visible && seconds == last_seconds && show_title == last_show_title) return;
+
+    char label[53];
+    if (show_title) {
+        char title[45];
+        const char* dot = strrchr(demo_current_name, '.');
+        size_t n = dot ? (size_t)(dot - demo_current_name) : strlen(demo_current_name);
+        if (n >= sizeof title) n = sizeof title - 1;
+        for (size_t i = 0; i < n; ++i)
+            title[i] = demo_current_name[i] == '_' ? ' ' : demo_current_name[i];
+        title[n] = '\0';
+        snprintf(label, sizeof label, "%s  %us", title, seconds);
+    } else {
+        snprintf(label, sizeof label, "%us", seconds);
+    }
+    graphics_set_overlay(label, true);
+    visible = true;
+    last_seconds = seconds;
+    last_show_title = show_title;
+}
+#else
+/* TFT/legacy output has no scanout OSD: retain the original LCD fallback. */
 static void demo_overlay_line(const unsigned y, uint8_t* line) {
     if (!demo_active || y < LCD_HEIGHT - 8) return;
     static char label[27];
@@ -500,6 +551,7 @@ static void demo_overlay_line(const unsigned y, uint8_t* line) {
             if (bits & (1u << b)) line[x * 6 + b] = 192;
     }
 }
+#endif
 
 /* Game Boy Color palettes often change in the middle of a frame (the status
  * bar under the play field gets its own colours).  The buffers keep 8-bit
@@ -582,8 +634,11 @@ void __time_critical_func(render_core)() {
     tuh_init(BOARD_TUH_RHPORT);
 #endif
     graphics_init();
+#if !(VGA || HDMI || SOFTTV)
+    // Framebuffer-only fallback (TFT): no scanout OSD and no backplane.
     graphics_set_palette(192, RGB888(255, 255, 255)); // Demo text
     graphics_set_palette(193, RGB888(0, 0, 0));       // Demo label background
+#endif
 
     const auto buffer = (uint8_t *)SCREEN;
     graphics_set_buffer(buffer, LCD_WIDTH, LCD_HEIGHT);
@@ -802,7 +857,9 @@ void __always_inline lcd_draw_line(struct gb_s* gb, const uint8_t pixels[160], c
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
             line[x] = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
     }
+#if !(VGA || HDMI || SOFTTV)
     demo_overlay_line(y, line);
+#endif
     if (y == LCD_HEIGHT - 1 && frame_started) {
         frame_started = false;
         if (gb->cgb.cgbMode) {
@@ -2651,6 +2708,15 @@ void menu() {
                             demo_requested = true;
                             demo_advance_pending = false;
                             f_save_conf();
+#if SOFTTV
+                            graphics_set_tv(tv_system == 0, true);
+#endif
+#if VGA || HDMI || SOFTTV
+                            graphics_set_scale((enum graphics_scale_t)screen_scale);
+#endif
+#if BACKPLANE
+                            apply_backplane();
+#endif
                             restart = true;
                             return;
                         }
@@ -2658,6 +2724,16 @@ void menu() {
                     case ROM_SELECT:
                         if (activate) {
                             demo_active = demo_requested = demo_advance_pending = false;
+                            f_save_conf(); // this exit used to lose the Screen setting
+#if SOFTTV
+                            graphics_set_tv(tv_system == 0, true);
+#endif
+#if VGA || HDMI || SOFTTV
+                            graphics_set_scale((enum graphics_scale_t)screen_scale);
+#endif
+#if BACKPLANE
+                            apply_backplane();
+#endif
                             restart = true;
                             return;
                         }
@@ -3005,6 +3081,9 @@ int main() {
                 i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
 #endif
             }
+#if VGA || HDMI || SOFTTV
+            demo_draw_title_overlay();
+#endif
             if (demo_active && time_us_64() - demo_game_started_at >=
                                (uint64_t)demo_seconds[demo_duration] * 1000000ull) {
                 demo_advance_pending = true;

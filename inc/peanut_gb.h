@@ -2119,6 +2119,15 @@ void __gb_step_cpu(struct gb_s *gb)
 	};
 	static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
 
+	/* A host frame may end while the CPU remains in HALT.  If no
+	 * enabled interrupt is pending, advance HALT clocks without fetching
+	 * the next opcode or corrupting the CPU stack/PC. */
+	if (gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE] & ANY_INTR))
+	{
+		opcode = 0x76; /* HALT: retain PC until an interrupt occurs */
+	}
+	else
+	{
 	/* Handle interrupts */
 	/* If gb_halt is positive, then an interrupt must have occured by the
 	 * time we reach here, becuase on HALT, we jump to the next interrupt
@@ -2168,8 +2177,9 @@ void __gb_step_cpu(struct gb_s *gb)
 		break;
 	}
 
-	/* Obtain opcode */
+	/* Obtain opcode only when CPU is not waiting in HALT. */
 	opcode = __gb_read(gb, gb->cpu_reg.pc.reg++);
+	}
 	inst_cycles = op_cycles[opcode];
 
 	/* Execute opcode */
@@ -3805,9 +3815,10 @@ void __gb_step_cpu(struct gb_s *gb)
 						!gb->display.interlace_count;
 				}
 #endif
-				/* HALT with IE=0 must not trap the host frame loop.
-				 * This is the same VBlank escape used by upstream Peanut-GB. */
-				if (gb->gb_halt && !gb->hram_io[IO_IE]) break;
+				/* The host frame is complete regardless of which interrupt is
+				 * enabled.  HALT may wait for a timer/STAT IRQ that will never
+				 * occur.  Leave gb_halt set but return control to main(). */
+				if (gb->gb_halt) break;
 			}
 			/* Normal Line */
 			else if(gb->hram_io[IO_LY] < LCD_HEIGHT)

@@ -164,6 +164,11 @@ gb_s gb;
 /* True only after a successful gb_init().  A menu entered from the ROM
  * browser must never use a non-initialised (or failed) GB context. */
 static bool gb_initialized = false;
+/* Host heartbeat: used only by the F11 hang diagnostic.  1 = GB CPU,
+ * 2 = audio, 0 = normal main loop.  Core 1 continues servicing USB while
+ * core 0 is blocked, so F11 can report the last live GB state. */
+static volatile uint32_t gb_debug_frame_id = 0;
+static volatile uint8_t gb_debug_phase = 0;
 /* A failed partial SD -> PSRAM/flash write may have damaged the ROM
  * underlying a still-running GB context.  Never resume it via F10. */
 static bool rom_image_damaged = false;
@@ -296,6 +301,18 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
         for (unsigned char i: report->keycode)
             printf("%2.2X", i);
         printf("\r\n");*/
+#if VGA || HDMI || SOFTTV
+    if (render_ready && isInReport(report, HID_KEY_F11) &&
+        !isInReport(prev_report, HID_KEY_F11)) {
+        char line[53];
+        snprintf(line, sizeof line, "DBG %lu P%u PC=%04X IE=%02X IF=%02X L=%02X H%u",
+                 (unsigned long)gb_debug_frame_id, (unsigned)gb_debug_phase,
+                 (unsigned)gb.cpu_reg.pc.reg, (unsigned)gb.hram_io[0xFF],
+                 (unsigned)gb.hram_io[0x0F], (unsigned)gb.hram_io[0x40],
+                 (unsigned)gb.gb_halt);
+        graphics_set_overlay(line, true);
+    }
+#endif
     if (replay_browser_active) {
         if (isInReport(report, HID_KEY_R) && !isInReport(prev_report, HID_KEY_R))
             replay_browser_command = 'R';
@@ -3475,7 +3492,9 @@ int main() {
             gb.direct.joypad_bits.start = !(game_keys & BTN_START);
 
             //-----------------------------------------------------------------
+            gb_debug_phase = 1;
             gb_run_frame(&gb);
+            gb_debug_phase = 2;
             replay_end_frame();
 
             //gb.direct.interlace = 1;
@@ -3489,6 +3508,8 @@ int main() {
                 i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
 #endif
             }
+            gb_debug_phase = 0;
+            ++gb_debug_frame_id;
 #if VGA || HDMI || SOFTTV
             if (replay_mode == REPLAY_RECORD) replay_draw_record_overlay();
             else demo_draw_title_overlay();

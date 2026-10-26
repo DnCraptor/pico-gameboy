@@ -765,7 +765,7 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 	case 0x0:
 		/* IO_BANK is only set to 1 if gb->gb_bootrom_read was not NULL
 		 * on reset. */
-		if(gb->hram_io[IO_BANK] == 0 && addr < 0x0100)
+		if(gb->hram_io[IO_BANK] == 0 && addr < 0x0100 && gb->gb_bootrom_read)
 		{
 			return gb->gb_bootrom_read(gb, addr);
 		}
@@ -1277,9 +1277,13 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			if(gb->cgb.cgbMode) gb->cgb.vramBankOffset = VRAM_ADDR - (gb->cgb.vramBank << 13);
 			return;
 #endif
-		/* Turn off boot ROM */
+		/* Turn off boot ROM.  Bit 0 unmaps it until the next reset; a
+		 * write of 0 does nothing (Dragon's Lair clears FF50 with the
+		 * sound registers: the boot ROM came back over the interrupt
+		 * vectors, and without a boot ROM it was a NULL call). */
 		case 0x50:
-			gb->hram_io[IO_BANK] = val;
+			if(val & 0x01)
+				gb->hram_io[IO_BANK] = 0x01;
 			return;
 #if PEANUT_FULL_GBC_SUPPORT
 		/* DMA Register */

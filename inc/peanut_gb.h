@@ -1622,22 +1622,6 @@ struct sprite_data {
 	uint8_t x;
 };
 
-#if PEANUT_GB_HIGH_LCD_ACCURACY
-static int compare_sprites(const void *in1, const void *in2)
-{
-	const struct sprite_data *sd1, *sd2;
-	int x_res;
-
-	sd1 = (struct sprite_data *)in1;
-	sd2 = (struct sprite_data *)in2;
-	x_res = (int)sd1->x - (int)sd2->x;
-	if(x_res != 0)
-		return x_res;
-
-	return (int)sd1->sprite_number - (int)sd2->sprite_number;
-}
-#endif
-
 void __gb_draw_line(struct gb_s *gb)
 {
 	uint8_t pixels[160] = {0};
@@ -1966,65 +1950,48 @@ void __gb_draw_line(struct gb_s *gb)
 	// draw sprites
 	if(gb->hram_io[IO_LCDC] & LCDC_OBJ_ENABLE)
 	{
-		uint8_t sprite_number;
-#if PEANUT_GB_HIGH_LCD_ACCURACY
 		uint8_t number_of_sprites = 0;
+		struct sprite_data sprites_to_render[MAX_SPRITES_LINE];
 
-		struct sprite_data sprites_to_render[NUM_SPRITES];
-
-		/* Record number of sprites on the line being rendered, limited
-		 * to the maximum number sprites that the Game Boy is able to
-		 * render on each line (10 sprites). */
-		for(sprite_number = 0;
-				sprite_number < PEANUT_GB_ARRAYSIZE(sprites_to_render);
+		/* OAM search selects the FIRST ten sprites intersecting the line,
+		 * regardless of X. Later OAM entries cannot displace them. */
+		for(uint8_t sprite_number = 0;
+				sprite_number < NUM_SPRITES && number_of_sprites < MAX_SPRITES_LINE;
 				sprite_number++)
 		{
-			/* Sprite Y position. */
-			uint8_t OY = gb->oam[sprite_number << 2];
-			/* Sprite X position. */
-			uint8_t OX = gb->oam[(sprite_number << 2)+ 1];
-
-			/* If sprite isn't on this line, continue. */
+			const uint8_t OY = gb->oam[sprite_number << 2];
 			if(gb->hram_io[IO_LY] +
-				(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY
-					|| gb->hram_io[IO_LY] + 16 < OY)
+				(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY ||
+				gb->hram_io[IO_LY] + 16 < OY)
 				continue;
-
-
 			sprites_to_render[number_of_sprites].sprite_number = sprite_number;
-			sprites_to_render[number_of_sprites].x = OX;
+			sprites_to_render[number_of_sprites].x = gb->oam[(sprite_number << 2) + 1];
 			number_of_sprites++;
 		}
+
 #if PEANUT_FULL_GBC_SUPPORT
 		if(!gb->cgb.cgbMode)
-		{
 #endif
-		/* If maximum number of sprites reached, prioritise X
-		 * coordinate and object location in OAM. */
-		qsort(&sprites_to_render[0], number_of_sprites,
-				sizeof(sprites_to_render[0]), compare_sprites);
-#if PEANUT_FULL_GBC_SUPPORT
+		{
+			/* DMG priority: lower X wins, then lower OAM index.
+			 * Stable insertion sort of at most ten entries; GBC keeps OAM order. */
+			for(uint8_t i = 1; i < number_of_sprites; i++)
+			{
+				const struct sprite_data entry = sprites_to_render[i];
+				uint8_t j = i;
+				while(j && sprites_to_render[j - 1].x > entry.x)
+				{
+					sprites_to_render[j] = sprites_to_render[j - 1];
+					j--;
+				}
+				sprites_to_render[j] = entry;
+			}
 		}
-#endif
-		if(number_of_sprites > MAX_SPRITES_LINE)
-			number_of_sprites = MAX_SPRITES_LINE;
-#endif
 
-		/* Render each sprite, from low priority to high priority. */
-#if PEANUT_GB_HIGH_LCD_ACCURACY
-		/* Render the top ten prioritised sprites on this scanline. */
-		for(sprite_number = number_of_sprites - 1;
-				sprite_number != 0xFF;
-				sprite_number--)
+		/* Paint lower-priority sprites first, preserving sprite transparency. */
+		for(uint8_t i = number_of_sprites; i; )
 		{
-			uint8_t s = sprites_to_render[sprite_number].sprite_number;
-#else
-		for (sprite_number = NUM_SPRITES - 1;
-			sprite_number != 0xFF;
-			sprite_number--)
-		{
-			uint8_t s = sprite_number;
-#endif
+			const uint8_t s = sprites_to_render[--i].sprite_number;
 			uint8_t py, t1, t2, dir, start, end, shift, disp_x;
 			/* Sprite Y position. */
 			uint8_t OY = gb->oam[s << 2];
@@ -2035,14 +2002,6 @@ void __gb_draw_line(struct gb_s *gb)
 				     & (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0xFE : 0xFF);
 			/* Additional attributes. */
 			uint8_t OF = gb->oam[(s << 2) + 3];
-
-#if !PEANUT_GB_HIGH_LCD_ACCURACY
-			/* If sprite isn't on this line, continue. */
-			if(gb->hram_io[IO_LY] +
-					(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY ||
-					gb->hram_io[IO_LY] + 16 < OY)
-				continue;
-#endif
 
 			/* Continue if sprite not visible. */
 			if(OX == 0 || OX >= 168)

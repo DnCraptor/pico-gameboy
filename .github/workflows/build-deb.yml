@@ -1,10 +1,10 @@
 name: ARM64 .deb (Orange Pi Zero 2W)
 
-# orange branch: the Linux ARM64 build.  The package is built on Debian 11
-# (bullseye): its glibc, libdrm and ALSA are the oldest of the distributions
-# for the Orange Pi Zero 2W, so the .deb also installs on Debian 12/13,
-# Ubuntu 22.04/24.04 and Armbian built on them (libasound2t64 provides
-# libasound2).
+# orange branch: the Linux ARM64 build.  The package is built on Ubuntu
+# 22.04 (jammy, glibc 2.35): the oldest glibc, libdrm and ALSA of the
+# supported distributions for the Orange Pi Zero 2W (Debian 11 is out of
+# support), so the .deb also installs on Debian 12/13, Ubuntu 24.04 and
+# Armbian built on them (libasound2t64 provides libasound2).
 #
 # - every push to orange: the .deb as a workflow artifact
 # - a tag orange-v*: a GitHub release with the .deb attached
@@ -19,14 +19,13 @@ permissions:
 
 jobs:
   deb:
-    runs-on: ubuntu-24.04-arm
-    container: debian:bullseye
+    runs-on: ubuntu-22.04-arm
     steps:
       - name: Install build dependencies
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config libdrm-dev libasound2-dev dpkg-dev file git ca-certificates
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libdrm-dev libasound2-dev dpkg-dev file
 
       - name: Check out
         uses: actions/checkout@v4

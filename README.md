@@ -17,7 +17,7 @@ cmake --build build -j
 
 ## DEB-пакет (ARM64)
 
-Готовый пакет собирает GitHub Actions (`.github/workflows/build-deb.yml`) на Debian 11 (bullseye): у него самые старые glibc, libdrm и ALSA среди дистрибутивов для Orange Pi Zero 2W, поэтому пакет ставится и на Debian 12/13, Ubuntu 22.04/24.04 и Armbian на их основе.
+Готовый пакет собирает GitHub Actions (`.github/workflows/build-deb.yml`) на Ubuntu 22.04 (glibc 2.35): у неё самые старые glibc, libdrm и ALSA среди поддерживаемых дистрибутивов для Orange Pi Zero 2W, поэтому пакет ставится на Ubuntu 22.04/24.04, Debian 12/13 и Armbian на их основе (Debian 11 и старше - нет).
 
 - каждый push в `orange` - пакет в артефактах сборки (вкладка Actions, `pico-gameboy-deb-arm64`);
 - тег `orange-v*` (например `orange-v3.1.9`) - релиз GitHub с приложенным `.deb`.

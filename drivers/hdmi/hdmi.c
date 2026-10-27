@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "fast_mem.h"
 #include <stdio.h>
 #include <string.h>
 #include "malloc.h"
@@ -206,32 +207,6 @@ static void line_rows_update(void) {
     line_row_scale = (int)graphics_scale;
 }
 
-/* The scanline IRQ must not call into the flash (memset / memcpy live there):
- * a flash fetch competing with the emulator (and the PSRAM on the same QMI)
- * delays the line.  volatile keeps the compiler from turning the loops back
- * into library calls. */
-static inline __attribute__((always_inline)) void irq_fill(uint8_t* dst, const uint8_t value, int count) {
-    if ((((uintptr_t)dst | (uintptr_t)count) & 3) == 0) {
-        volatile uint32_t* d = (volatile uint32_t *)dst;
-        const uint32_t v = value * 0x01010101u;
-        for (count >>= 2; count > 0; count--) *d++ = v;
-        return;
-    }
-    volatile uint8_t* d = dst;
-    while (count-- > 0) *d++ = value;
-}
-
-static inline __attribute__((always_inline)) void irq_copy(uint8_t* dst, const uint8_t* src, int count) {
-    if ((((uintptr_t)dst | (uintptr_t)src | (uintptr_t)count) & 3) == 0) {
-        volatile uint32_t* d = (volatile uint32_t *)dst;
-        const uint32_t* s = (const uint32_t *)src;
-        for (count >>= 2; count > 0; count--) *d++ = *s++;
-        return;
-    }
-    volatile uint8_t* d = dst;
-    while (count-- > 0) *d++ = *src++;
-}
-
 /* in RAM, not in SCRATCH_Y: SCRATCH_Y is the stack of core 0, and code there
  * leaves the stack too little room (it grew into this handler) */
 static void __not_in_flash_func(dma_handler_HDMI)() {
@@ -281,7 +256,7 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
 
         if (overlay_row) {
             const int y = (line + 1) >> 1;
-            irq_fill(output_buffer, GRAPHICS_OSD_BG, SCREEN_WIDTH);
+            fast_memset(output_buffer, GRAPHICS_OSD_BG, SCREEN_WIDTH);
             if (y >= OVERLAY_TEXT_Y && y < OVERLAY_TEXT_Y + 8) {
                 const uint8_t index = overlay_text_index;
                 const char* const str = overlay_text[index];
@@ -297,8 +272,8 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
             // the backplane cell row of the line the buffer is shown on
             const uint8_t* bp = backplane_cells ? backplane_cells + ((line + 1) >> 1) * BACKPLANE_W : NULL;
             if (scaled_row < 0) {
-                if (bp) irq_copy(output_buffer, bp, SCREEN_WIDTH);
-                else irq_fill(output_buffer, 255, SCREEN_WIDTH);
+                if (bp) fast_memcpy(output_buffer, bp, SCREEN_WIDTH);
+                else fast_memset(output_buffer, 255, SCREEN_WIDTH);
             } else {
                 const uint8_t* src = &graphics_buffer[scaled_row * graphics_buffer_width];
                 const int w = graphics_buffer_width;
@@ -306,11 +281,11 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
                 const int out_w = graphics_scale == GRAPHICS_SCALE_3X ? w * 3 / 2
                                 : graphics_scale == GRAPHICS_SCALE_2X ? w : SCREEN_WIDTH;
                 const int left = (SCREEN_WIDTH - out_w) / 2;
-                if (bp) irq_copy(output_buffer, bp, left);
-                else irq_fill(output_buffer, 255, left);
+                if (bp) fast_memcpy(output_buffer, bp, left);
+                else fast_memset(output_buffer, 255, left);
                 uint8_t* out = output_buffer + left;
                 if (gray_row) {
-                    irq_fill(out, gray_slot, out_w);
+                    fast_memset(out, gray_slot, out_w);
                     out += out_w;
                 }
                 else if (graphics_scale == GRAPHICS_SCALE_2X) {
@@ -333,12 +308,12 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
                     for (int x = 0; x < w; x++) {
                         uint8_t c = src[x];
                         c = ((c & 0xf0) == 0xf0) ? 255 : c;
-                        irq_fill(out, c, k);
+                        fast_memset(out, c, k);
                         out += k;
                     }
                 }
-                if (bp) irq_copy(out, bp + (out - output_buffer), output_buffer + SCREEN_WIDTH - out);
-                else irq_fill(out, 255, output_buffer + SCREEN_WIDTH - out);
+                if (bp) fast_memcpy(out, bp + (out - output_buffer), output_buffer + SCREEN_WIDTH - out);
+                else fast_memset(out, 255, output_buffer + SCREEN_WIDTH - out);
             }
         } else
         switch (graphics_mode) {
@@ -352,36 +327,36 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
                     const int r = y - graphics_buffer_shift_y;
                     const int x0 = graphics_buffer_shift_x, w = graphics_buffer_width;
                     if (r < 0 || r >= graphics_buffer_height || x0 < 0 || x0 + w > SCREEN_WIDTH) {
-                        irq_copy(output_buffer, bp, SCREEN_WIDTH);
+                        fast_memcpy(output_buffer, bp, SCREEN_WIDTH);
                         break;
                     }
-                    irq_copy(output_buffer, bp, x0);
+                    fast_memcpy(output_buffer, bp, x0);
                     const uint8_t* src = &graphics_buffer[r * w];
                     uint8_t* out = output_buffer + x0;
                     for (int x = 0; x < w; x++) {
                         const uint8_t c = src[x];
                         *out++ = ((c & 0xf0) == 0xf0) ? 255 : c;
                     }
-                    irq_copy(out, bp + x0 + w, SCREEN_WIDTH - x0 - w);
+                    fast_memcpy(out, bp + x0 + w, SCREEN_WIDTH - x0 - w);
                     break;
                 }
                 // uint8_t* input_buffer = &graphics_buffer[(line / 3) * graphics_buffer_width];
                 //заполняем пространство сверху и снизу графического буфера
                 if (y < graphics_buffer_shift_y) {
-                    irq_fill(output_buffer, 255, SCREEN_WIDTH);
+                    fast_memset(output_buffer, 255, SCREEN_WIDTH);
                     break;
                 }
                 if (false || (graphics_buffer_shift_y > y) || (y >= (graphics_buffer_shift_y + graphics_buffer_height))
                     || (graphics_buffer_shift_x >= SCREEN_WIDTH) || (
                         (graphics_buffer_shift_x + graphics_buffer_width) < 0)) {
-                    irq_fill(output_buffer, 255,SCREEN_WIDTH);
+                    fast_memset(output_buffer, 255,SCREEN_WIDTH);
                     break;
                         }
 
                 uint8_t* activ_buf_end = output_buffer + SCREEN_WIDTH;
                 //рисуем пространство слева от буфера
                 if (graphics_buffer_shift_x > 0) {
-                    irq_fill(output_buffer, 255, graphics_buffer_shift_x);
+                    fast_memset(output_buffer, 255, graphics_buffer_shift_x);
                     output_buffer += graphics_buffer_shift_x;
                 }
 
@@ -392,14 +367,14 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
 
                 if (graphics_buffer_shift_x < 0) input_buffer -= graphics_buffer_shift_x;
 
-                while (activ_buf_end > output_buffer) {
-                    if (input_buffer < input_buffer_end) {
-                        uint8_t i_color = *input_buffer++;
-                        i_color = ((i_color & 0xf0) == 0xf0) ? 255 : i_color;
-                        *output_buffer++ = i_color;
-                    }
-                    else
-                        *output_buffer++ = 255;
+                while (activ_buf_end > output_buffer && input_buffer < input_buffer_end) {
+                    uint8_t i_color = *input_buffer++;
+                    i_color = ((i_color & 0xf0) == 0xf0) ? 255 : i_color;
+                    *output_buffer++ = i_color;
+                }
+                if (activ_buf_end > output_buffer) {
+                    fast_memset(output_buffer, 255, activ_buf_end - output_buffer);
+                    output_buffer = activ_buf_end;
                 }
 
                 break;
@@ -436,23 +411,23 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
         }
 
 
-        // irq_fill(activ_buf,2,320);//test
+        // fast_memset(activ_buf,2,320);//test
 
         //ССИ
         //для выравнивания синхры
 
         // --|_|---|_|---|_|----
         //---|___________|-----
-        irq_fill(activ_buf + 48,BASE_HDMI_CTRL_INX, 24);
-        irq_fill(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
-        irq_fill(activ_buf + 392,BASE_HDMI_CTRL_INX, 8);
+        fast_memset(activ_buf + 48,BASE_HDMI_CTRL_INX, 24);
+        fast_memset(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
+        fast_memset(activ_buf + 392,BASE_HDMI_CTRL_INX, 8);
 
         //без выравнивания
         // --|_|---|_|---|_|----
         //------|___________|----
-        //   irq_fill(activ_buf+320,BASE_HDMI_CTRL_INX,8);
-        //   irq_fill(activ_buf+328,BASE_HDMI_CTRL_INX+1,48);
-        //   irq_fill(activ_buf+376,BASE_HDMI_CTRL_INX,24);
+        //   fast_memset(activ_buf+320,BASE_HDMI_CTRL_INX,8);
+        //   fast_memset(activ_buf+328,BASE_HDMI_CTRL_INX+1,48);
+        //   fast_memset(activ_buf+376,BASE_HDMI_CTRL_INX,24);
     }
     else {
         if ((line >= 490) && (line < 492)) {
@@ -460,26 +435,26 @@ static void __not_in_flash_func(dma_handler_HDMI)() {
             //для выравнивания синхры
             // --|_|---|_|---|_|----
             //---|___________|-----
-            irq_fill(activ_buf + 48,BASE_HDMI_CTRL_INX + 2, 352);
-            irq_fill(activ_buf,BASE_HDMI_CTRL_INX + 3, 48);
+            fast_memset(activ_buf + 48,BASE_HDMI_CTRL_INX + 2, 352);
+            fast_memset(activ_buf,BASE_HDMI_CTRL_INX + 3, 48);
             //без выравнивания
             // --|_|---|_|---|_|----
             //-------|___________|----
 
-            // irq_fill(activ_buf,BASE_HDMI_CTRL_INX+2,328);
-            // irq_fill(activ_buf+328,BASE_HDMI_CTRL_INX+3,48);
-            // irq_fill(activ_buf+376,BASE_HDMI_CTRL_INX+2,24);
+            // fast_memset(activ_buf,BASE_HDMI_CTRL_INX+2,328);
+            // fast_memset(activ_buf+328,BASE_HDMI_CTRL_INX+3,48);
+            // fast_memset(activ_buf+376,BASE_HDMI_CTRL_INX+2,24);
         }
         else {
             //ССИ без изображения
             //для выравнивания синхры
 
-            irq_fill(activ_buf + 48,BASE_HDMI_CTRL_INX, 352);
-            irq_fill(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
+            fast_memset(activ_buf + 48,BASE_HDMI_CTRL_INX, 352);
+            fast_memset(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
 
-            // irq_fill(activ_buf,BASE_HDMI_CTRL_INX,328);
-            // irq_fill(activ_buf+328,BASE_HDMI_CTRL_INX+1,48);
-            // irq_fill(activ_buf+376,BASE_HDMI_CTRL_INX,24);
+            // fast_memset(activ_buf,BASE_HDMI_CTRL_INX,328);
+            // fast_memset(activ_buf+328,BASE_HDMI_CTRL_INX+1,48);
+            // fast_memset(activ_buf+376,BASE_HDMI_CTRL_INX,24);
         };
     }
 

@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "fast_mem.h"
 #include "hardware/clocks.h"
 #include "stdbool.h"
 #include "hardware/structs/pll.h"
@@ -211,7 +212,8 @@ void __time_critical_func() dma_handler_VGA() {
             if (row >= 0) {
                 const uint8_t* src = input_buffer + row * w;
                 if (gray_row) {
-                    for (int i = k * w; i--;) *out++ = gray_wire;
+                    fast_memset((uint8_t *)out, gray_wire, k * w);
+                    out += k * w;
                 }
                 else if (gray_col) {
                     for (int x = 0; x < w; x++) {
@@ -256,7 +258,8 @@ void __time_critical_func() dma_handler_VGA() {
         const uint8_t* src = input_buffer + row * w;
         volatile uint8_t* out = dst + left; // volatile: no memset calls (in the flash)
         if (gray_row) {
-            for (int i = k * w; i--;) *out++ = gray_wire;
+            fast_memset((uint8_t *)out, gray_wire, k * w);
+            out += k * w;
         }
         else if (gray_col) {
             for (int x = 0; x < w; x++) {

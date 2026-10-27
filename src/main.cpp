@@ -3309,9 +3309,6 @@ int main() {
     i2s_init(&i2s_config);
 #endif
 
-    // Initialize audio emulation
-    audio_init();
-
     FRESULT fr = f_mount(&fs, "", 1);
     if (FR_OK != fr) {
         printf("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
@@ -3394,6 +3391,9 @@ int main() {
             continue;
         }
         gb_initialized = true;
+        /* A new APU for every start: the channels of the previous game
+         * (or of this one before a reset) must not sound in the first frames. */
+        audio_init();
 
         /* The colours of a Game Boy game: the palette saved for it, or the selected one */
         apply_game_palette_on_load();

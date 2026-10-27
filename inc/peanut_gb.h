@@ -758,6 +758,18 @@ struct gb_s
  * Internal function used to read bytes.
  * addr is host platform endian.
  */
+/* The VBlank IRQ is requested a little after LY becomes 144: on the DMG
+ * LY = 144 is readable for a few cycles before the interrupt.  A game polling
+ * LY == 144 with the VBlank IRQ enabled (RoboCop 2, before turning the LCD
+ * off: LDH A,(44) / CP 90 / JR NZ - 32 cycles) otherwise never saw 144: the
+ * handler ran first and returned on line 145, every frame in the same phase.
+ * This core counts whole instructions, so the window is one such loop:
+ * the IRQ comes after the first instruction that ends 32 cycles or more
+ * after LY = 144. */
+#define GB_VBLANK_IRQ_DELAY 32
+static uint8_t gb_vblank_irq_delayed = 0;
+static uint8_t gb_vblank_irq_wait = 0;
+
 uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
@@ -3652,6 +3664,16 @@ void __gb_step_cpu(struct gb_s *gb)
 
 	do
 	{
+		if(gb_vblank_irq_delayed)
+		{
+			gb_vblank_irq_wait += inst_cycles;
+			if(gb_vblank_irq_wait >= GB_VBLANK_IRQ_DELAY || gb->gb_halt)
+			{
+				gb_vblank_irq_delayed = 0;
+				gb->hram_io[IO_IF] |= VBLANK_INTR;
+			}
+		}
+
 #if ENABLE_SOUND && !HWAY
 		/* Advance the audio clock once per emulated CPU timeslice.
 		 * Only APU register writes actually trigger audio rendering. */
@@ -3803,7 +3825,14 @@ void __gb_step_cpu(struct gb_s *gb)
 				gb->hram_io[IO_STAT] =
 					(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_VBLANK;
 				gb->gb_frame = 1;
-				gb->hram_io[IO_IF] |= VBLANK_INTR;
+				/* in HALT nothing can read LY: wake up at once */
+				if(gb->gb_halt)
+					gb->hram_io[IO_IF] |= VBLANK_INTR;
+				else
+				{
+					gb_vblank_irq_delayed = 1;
+					gb_vblank_irq_wait = 0;
+				}
 				gb->lcd_blank = 0;
 
 				if(gb->hram_io[IO_STAT] & STAT_MODE_1_INTR)
@@ -3957,7 +3986,11 @@ uint8_t gb_colour_hash(struct gb_s *gb)
 void gb_reset(struct gb_s *gb)
 {
 	gb->gb_halt = 0;
-	gb->gb_ime = 1;
+	gb_vblank_irq_delayed = 0;
+	/* The boot ROM jumps to 0x0100 with interrupts disabled (IME = 0):
+	 * a game may set IE and clear the RAM before its EI (RoboCop 2 - a
+	 * VBlank IRQ then called the OAM DMA routine not yet copied to HRAM). */
+	gb->gb_ime = 0;
 
 	/* Initialise MBC values. */
 	gb->selected_rom_bank = 1;

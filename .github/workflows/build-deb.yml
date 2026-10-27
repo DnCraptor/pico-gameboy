@@ -1,0 +1,55 @@
+name: ARM64 .deb (Orange Pi Zero 2W)
+
+# orange branch: the Linux ARM64 build.  The package is built on Debian 11
+# (bullseye): its glibc, libdrm and ALSA are the oldest of the distributions
+# for the Orange Pi Zero 2W, so the .deb also installs on Debian 12/13,
+# Ubuntu 22.04/24.04 and Armbian built on them (libasound2t64 provides
+# libasound2).
+#
+# - every push to orange: the .deb as a workflow artifact
+# - a tag orange-v*: a GitHub release with the .deb attached
+on:
+  push:
+    branches: [ orange ]
+    tags: [ "orange-v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04-arm
+    container: debian:bullseye
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libdrm-dev libasound2-dev dpkg-dev file git ca-certificates
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Package
+        run: |
+          cd build
+          cpack -G DEB
+          for f in *.deb; do dpkg-deb -I "$f"; dpkg-deb -c "$f"; done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-gameboy-deb-arm64
+          path: build/*.deb
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/orange-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.deb

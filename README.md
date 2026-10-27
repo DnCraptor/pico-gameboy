@@ -17,17 +17,27 @@ cmake --build build -j
 
 ## DEB-пакет (ARM64)
 
-На Orange Pi Zero 2W, после сборки из этого бранча:
+Готовый пакет собирает GitHub Actions (`.github/workflows/build-deb.yml`) на Debian 11 (bullseye): у него самые старые glibc, libdrm и ALSA среди дистрибутивов для Orange Pi Zero 2W, поэтому пакет ставится и на Debian 12/13, Ubuntu 22.04/24.04 и Armbian на их основе.
+
+- каждый push в `orange` - пакет в артефактах сборки (вкладка Actions, `pico-gameboy-deb-arm64`);
+- тег `orange-v*` (например `orange-v3.1.9`) - релиз GitHub с приложенным `.deb`.
+
+Установка на любой ARM64-машине, без сборки:
+
+```sh
+sudo apt install ./pico-gameboy_3.1.9_arm64.deb
+sudo gameboy /путь/к/каталогу/данных
+```
+
+Пакет устанавливает `/usr/bin/gameboy` и документацию в `/usr/share/doc/pico-gameboy/`; зависимости (`libc6`, `libdrm2`, `libasound2`) `apt` доставит сам. Каталог данных в пакет не включается и при удалении пакета не затрагивается. Удаление: `sudo apt remove pico-gameboy`.
+
+Пакет можно собрать и на самой Orange Pi, после сборки из этого бранча:
 
 ```sh
 (cd build && cpack -G DEB)
-dpkg-deb -I build/pico-gameboy_3.1.9_arm64.deb
-sudo apt install ./build/pico-gameboy_3.1.9_arm64.deb
 ```
 
-Пакет устанавливает `/usr/bin/gameboy` и документацию в `/usr/share/doc/pico-gameboy/`.
-Зависимости ALSA и libdrm определяются `dpkg-shlibdeps` во время упаковки.
-Каталог данных в пакет не включается и при удалении пакета не затрагивается.
+но тогда зависимости берутся из её дистрибутива (например, собранный на Debian 13 / Ubuntu 24.04 пакет требует новую glibc и `libasound2t64` и не встанет на Debian 12 / Ubuntu 22.04).
 
 ## Запуск
 

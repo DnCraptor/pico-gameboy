@@ -939,6 +939,27 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
  * it may happen in the middle of a frame (src/main.cpp) */
 void gb_cgb_palette_changed(uint8_t index);
 
+/**
+ * Re-evaluates LY == LYC after a write to STAT or LYC.
+ * The STAT interrupt fires on a rising edge of the LYC condition,
+ * lyc_line is its state before the write.
+ */
+static void __gb_lyc_update(struct gb_s *gb, uint8_t lyc_line)
+{
+	if(!(gb->hram_io[IO_LCDC] & LCDC_ENABLE))
+		return;
+
+	if(gb->hram_io[IO_LY] == gb->hram_io[IO_LYC])
+	{
+		gb->hram_io[IO_STAT] |= STAT_LYC_COINC;
+
+		if(!lyc_line && (gb->hram_io[IO_STAT] & STAT_LYC_INTR))
+			gb->hram_io[IO_IF] |= LCDC_INTR;
+	}
+	else
+		gb->hram_io[IO_STAT] &= ~STAT_LYC_COINC;
+}
+
 void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
@@ -1207,8 +1228,14 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		}
 
 		case 0x41:
+		{
+			uint8_t lyc_line = (gb->hram_io[IO_STAT] & STAT_LYC_COINC) &&
+				(gb->hram_io[IO_STAT] & STAT_LYC_INTR);
 			gb->hram_io[IO_STAT] = (val & STAT_USER_BITS) | (gb->hram_io[IO_STAT] & STAT_MODE);
+			/* enabling the LYC interrupt while LY == LYC raises it at once */
+			__gb_lyc_update(gb, lyc_line);
 			return;
+		}
 
 		case 0x42:
 			gb->hram_io[IO_SCY] = val;
@@ -1220,8 +1247,14 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		/* LY (0xFF44) is read only. */
 		case 0x45:
+		{
+			uint8_t lyc_line = (gb->hram_io[IO_STAT] & STAT_LYC_COINC) &&
+				(gb->hram_io[IO_STAT] & STAT_LYC_INTR);
 			gb->hram_io[IO_LYC] = val;
+			/* LY == LYC is compared all the time, not only when LY changes */
+			__gb_lyc_update(gb, lyc_line);
 			return;
+		}
 
 		/* DMA Register */
 		case 0x46:

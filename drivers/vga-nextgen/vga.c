@@ -161,7 +161,10 @@ void __time_critical_func() dma_handler_VGA() {
     if (overlay_enabled && graphics_mode == GRAPHICSMODE_DEFAULT && overlay_y >= OVERLAY_BAR_Y) {
         if (screen_line & 1) return;
         uint16_t* const dst = (uint16_t*)((uint8_t*)*output_buffer + shift_picture);
-        const uint16_t bg = palette[0][GRAPHICS_OSD_BG], fg = palette[0][GRAPHICS_OSD_FG];
+        /* 255 is the screen border colour on HDMI / TV; on VGA the border is
+         * bg_color and palette[255] is just a palette entry (light): use
+         * the border colour, as the other drivers do */
+        const uint16_t bg = (uint16_t)bg_color[0], fg = palette[0][GRAPHICS_OSD_FG];
         for (int x = 0; x < visible_line_size; ++x) dst[x] = bg;
         if (overlay_y >= OVERLAY_TEXT_Y && overlay_y < OVERLAY_TEXT_Y + 8) {
             const uint8_t index = overlay_text_index;

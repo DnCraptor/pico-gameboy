@@ -495,19 +495,20 @@ static uint8_t (*const frames[3])[LCD_WIDTH] = {SCREEN, SCREEN_2[0], SCREEN_2[1]
  * of the previous frame.  Games use it for transparency: a sprite drawn every
  * second frame is half-transparent there, while a fast screen shows it
  * flickering.  So a Game Boy (not Color) frame is shown mixed 1:1 with the
- * previous one: slots 12..77 hold the mixes of two different colours of the
- * slots 0..11 (a Game Boy Color game has its own palette there). */
+ * previous one: slots 12..143 hold the transitions between two different
+ * colours of the slots 0..11, one slot per ordered (previous, current) pair:
+ * a 16 shades preset has different colours for A->B and B->A (a Game Boy
+ * Color game has its own palette there). */
 static uint8_t lcd_ghosting = 1;
 static constexpr uint8_t DMG_SLOTS = 12;
-static uint8_t blend_slot[DMG_SLOTS][DMG_SLOTS];
+static uint8_t blend_slot[DMG_SLOTS][DMG_SLOTS]; // [previous][current]
 static uint8_t blend_prev[LCD_HEIGHT][LCD_WIDTH / 2]; // the previous frame, slots 0..11 (4 bits each)
 
 static void blend_slots_init() {
     uint8_t next = DMG_SLOTS;
     for (uint8_t a = 0; a < DMG_SLOTS; a++) {
-        blend_slot[a][a] = a;
-        for (uint8_t b = a + 1; b < DMG_SLOTS; b++)
-            blend_slot[a][b] = blend_slot[b][a] = next++;
+        for (uint8_t b = 0; b < DMG_SLOTS; b++)
+            blend_slot[a][b] = a == b ? a : next++;
     }
 }
 
@@ -2158,7 +2159,7 @@ static uint32_t rgb565_to_rgb888(const uint16_t c) {
 }
 
 /* the colours in use go to the video driver (slots 0..11, their mixes for
- * the LCD ghosting 12..77); a Game Boy Color game keeps its own palette in
+ * the LCD ghosting 12..143); a Game Boy Color game keeps its own palette in
  * slots 0..191 */
 static void palette_apply() {
     if (gb.cgb.cgbMode) return;
@@ -2174,7 +2175,8 @@ static void palette_apply() {
             rgb[slot] = c;
         }
     for (uint8_t a = 0; a < DMG_SLOTS; a++)
-        for (uint8_t b = a + 1; b < DMG_SLOTS; b++) {
+        for (uint8_t b = 0; b < DMG_SLOTS; b++) {
+            if (a == b) continue;
             const uint32_t r = ((rgb[a] >> 16 & 0xFF) + (rgb[b] >> 16 & 0xFF) + 1) / 2;
             const uint32_t g = ((rgb[a] >> 8 & 0xFF) + (rgb[b] >> 8 & 0xFF) + 1) / 2;
             const uint32_t bl = ((rgb[a] & 0xFF) + (rgb[b] & 0xFF) + 1) / 2;
@@ -2198,22 +2200,14 @@ static void palette16_apply() {
             const uint32_t r = (c >> 16) & 255u, g = (c >> 8) & 255u, b = c & 255u;
             graphics_set_palette(layer_hw[layer] * 4 + shade, RGB888(r, g, b));
         }
-    /* Ghosting uses ordered (previous,current) pairs created by blend_slots_init.
-     * At level 6 use the exact table entry; levels 1..5 blend toward the
-     * diagonal (steady) shade. At level 0 the renderer uses base slots only. */
-    const unsigned strength = lcd_ghosting > 6 ? 6 : lcd_ghosting;
+    /* LCD ghosting: the transition from the previous shade to the current one
+     * is the table entry itself, current * 4 + previous.  Every ordered
+     * (previous, current) pair has its own slot (blend_slots_init). */
     for (unsigned prev = 0; prev < DMG_SLOTS; prev++)
         for (unsigned curr = 0; curr < DMG_SLOTS; curr++) {
             if (prev == curr) continue;
-            const unsigned now = curr & 3u, old = prev & 3u;
-            const uint32_t steady = rgb[now * 4 + now];
-            const uint32_t transient = rgb[now * 4 + old];
-            const uint32_t r = (((steady >> 16) & 255u) * (6u - strength) +
-                                ((transient >> 16) & 255u) * strength + 3u) / 6u;
-            const uint32_t g = (((steady >> 8) & 255u) * (6u - strength) +
-                                ((transient >> 8) & 255u) * strength + 3u) / 6u;
-            const uint32_t b = ((steady & 255u) * (6u - strength) +
-                                (transient & 255u) * strength + 3u) / 6u;
+            const uint32_t c = rgb[(curr & 3u) * 4 + (prev & 3u)];
+            const uint32_t r = (c >> 16) & 255u, g = (c >> 8) & 255u, b = c & 255u;
             graphics_set_palette(blend_slot[prev][curr], RGB888(r, g, b));
         }
 }

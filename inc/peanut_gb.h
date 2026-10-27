@@ -2140,10 +2140,90 @@ void __gb_draw_line(struct gb_s *gb)
 /**
  * Internal function used to step the CPU.
  */
+/**
+ * Cycles to the next event while in HALT: the next LCD mode or line, a timer
+ * tick or a serial byte, whichever comes first.  Called at HALT and again on
+ * every step of the HALT loop: a step reused for the following events
+ * overshoots them, LCD modes are passed and lines are not drawn.
+ */
+/* Timer: CPU cycles per TIMA tick, by TAC bits 0..1 */
+static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
+
+static uint_fast16_t __gb_halt_cycles(struct gb_s *gb)
+{
+	int_fast16_t halt_cycles = INT_FAST16_MAX;
+
+	if(gb->hram_io[IO_SC] & SERIAL_SC_TX_START)
+	{
+		int serial_cycles = SERIAL_CYCLES -
+			gb->counter.serial_count;
+
+		if(serial_cycles < halt_cycles)
+			halt_cycles = serial_cycles;
+	}
+
+	if(gb->hram_io[IO_TAC] & IO_TAC_ENABLE_MASK)
+	{
+		int tac_cycles = TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK] -
+			gb->counter.tima_count;
+
+		if(tac_cycles < halt_cycles)
+			halt_cycles = tac_cycles;
+	}
+
+	if((gb->hram_io[IO_LCDC] & LCDC_ENABLE))
+	{
+		int lcd_cycles;
+
+		/* If LCD is in HBlank, calculate the number of cycles
+		 * until the end of HBlank and the start of mode 2 or
+		 * mode 1. */
+		if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK)
+		{
+			lcd_cycles = LCD_MODE_2_CYCLES -
+				     gb->counter.lcd_count;
+		}
+		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_OAM)
+		{
+			lcd_cycles = LCD_MODE_3_CYCLES -
+				gb->counter.lcd_count;
+		}
+		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_TRANSFER &&
+				gb->counter.lcd_count < LCD_MODE_0_CYCLES)
+		{
+			lcd_cycles = LCD_MODE_0_CYCLES -
+				gb->counter.lcd_count;
+		}
+		else
+		{
+			/* VBlank, or the end of a drawn line */
+			lcd_cycles =
+				LCD_LINE_CYCLES - gb->counter.lcd_count;
+		}
+
+		if(lcd_cycles < halt_cycles)
+			halt_cycles = lcd_cycles;
+	}
+	else if (halt_cycles > LCD_LINE_CYCLES)
+	{
+		/* With LCD off, the HALT fast-forward still needs bounded
+		 * steps for DIV/TIMA/serial and a responsive host frame. */
+		halt_cycles = LCD_LINE_CYCLES;
+	}
+
+	/* Some halt cycles may already be very high, so make sure we
+	 * don't underflow here. */
+	if(halt_cycles <= 0)
+		halt_cycles = 4;
+
+	return (uint_fast16_t)halt_cycles;
+}
+
 void __gb_step_cpu(struct gb_s *gb)
 {
 	uint8_t opcode;
 	uint_fast16_t inst_cycles;
+	uint8_t halt_loop = 0;
 	static const uint8_t op_cycles[0x100] =
 	{
 		/* *INDENT-OFF* */
@@ -2166,7 +2246,6 @@ void __gb_step_cpu(struct gb_s *gb)
 		12,12,8, 4, 0,16, 8,16,12, 8,16, 4, 0, 0, 8,16	/* 0xF0 */
 		/* *INDENT-ON* */
 	};
-	static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
 
 	/* A host frame may end while the CPU remains in HALT.  If no
 	 * enabled interrupt is pending, advance HALT clocks without fetching
@@ -2874,77 +2953,10 @@ void __gb_step_cpu(struct gb_s *gb)
 		break;
 
 	case 0x76: /* HALT */
-	{
-		int_fast16_t halt_cycles = INT_FAST16_MAX;
-
 		/* TODO: Emulate HALT bug? */
 		gb->gb_halt = 1;
-
-		if(gb->hram_io[IO_SC] & SERIAL_SC_TX_START)
-		{
-			int serial_cycles = SERIAL_CYCLES -
-				gb->counter.serial_count;
-
-			if(serial_cycles < halt_cycles)
-				halt_cycles = serial_cycles;
-		}
-
-		if(gb->hram_io[IO_TAC] & IO_TAC_ENABLE_MASK)
-		{
-			int tac_cycles = TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK] -
-				gb->counter.tima_count;
-
-			if(tac_cycles < halt_cycles)
-				halt_cycles = tac_cycles;
-		}
-
-		if((gb->hram_io[IO_LCDC] & LCDC_ENABLE))
-		{
-			int lcd_cycles;
-
-			/* If LCD is in HBlank, calculate the number of cycles
-			 * until the end of HBlank and the start of mode 2 or
-			 * mode 1. */
-			if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK)
-			{
-				lcd_cycles = LCD_MODE_2_CYCLES -
-					     gb->counter.lcd_count;
-			}
-			else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_OAM)
-			{
-				lcd_cycles = LCD_MODE_3_CYCLES -
-					gb->counter.lcd_count;
-			}
-			else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_TRANSFER)
-			{
-				lcd_cycles = LCD_MODE_0_CYCLES -
-					gb->counter.lcd_count;
-			}
-			else
-			{
-				/* VBlank */
-				lcd_cycles =
-					LCD_LINE_CYCLES - gb->counter.lcd_count;
-			}
-
-			if(lcd_cycles < halt_cycles)
-				halt_cycles = lcd_cycles;
-		}
-		else if (halt_cycles > LCD_LINE_CYCLES)
-		{
-			/* With LCD off, the HALT fast-forward still needs bounded
-			 * steps for DIV/TIMA/serial and a responsive host frame. */
-			halt_cycles = LCD_LINE_CYCLES;
-		}
-
-		/* Some halt cycles may already be very high, so make sure we
-		 * don't underflow here. */
-		if(halt_cycles <= 0)
-			halt_cycles = 4;
-
-		inst_cycles = (uint_fast16_t)halt_cycles;
+		inst_cycles = __gb_halt_cycles(gb);
 		break;
-	}
 
 	case 0x77: /* LD (HL), A */
 		__gb_write(gb, gb->cpu_reg.hl.reg, gb->cpu_reg.a);
@@ -3697,6 +3709,11 @@ void __gb_step_cpu(struct gb_s *gb)
 
 	do
 	{
+		/* In HALT every step goes to the next event (see __gb_halt_cycles) */
+		if(halt_loop)
+			inst_cycles = __gb_halt_cycles(gb);
+		halt_loop = 1;
+
 		if(gb_vblank_irq_delayed)
 		{
 			gb_vblank_irq_wait += inst_cycles;

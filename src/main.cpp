@@ -1186,6 +1186,36 @@ static void fb_remember(const char* dir, const char* name) {
     fb_focus[sizeof fb_focus - 1] = '\0';
 }
 
+/* Check Demo candidates on SD before replacing the current ROM in
+ * PSRAM/Flash.  Peanut-GB rejects a bad header checksum or unsupported
+ * cartridge; such images must not terminate the entire demo carousel. */
+static bool demo_rom_header_ok(const char* pathname) {
+    static FIL file;
+    static uint8_t header[0x150]; // keep core 0's stack small
+    UINT received = 0;
+    if (f_open(&file, pathname, FA_READ) != FR_OK) return false;
+    const FSIZE_t file_bytes = f_size(&file);
+    const FRESULT read_result = f_read(&file, header, sizeof header, &received);
+    const FRESULT close_result = f_close(&file);
+    if (read_result != FR_OK || close_result != FR_OK || received != sizeof header)
+        return false;
+
+    uint8_t check = 0;
+    for (unsigned i = 0x134; i <= 0x14c; ++i)
+        check = (uint8_t)(check - header[i] - 1);
+    if (check != header[0x14d] || header[0x148] > 8 ||
+        header[0x149] > 5 || file_bytes < (32768u << header[0x148]))
+        return false;
+
+    /* Same accepted cartridge types as the cart_mbc table in peanut_gb.h. */
+    static const uint8_t supported[31] = {
+        1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1,
+        1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1
+    };
+    const uint8_t cart = header[0x147];
+    return cart < sizeof supported && supported[cart];
+}
+
 /* The demo visits playable ROMs in the directory where it was launched.
  * It chooses lexicographically, without heap allocation or a large list. */
 static bool demo_load_next_rom(const char* after) {
@@ -1208,7 +1238,9 @@ static bool demo_load_next_rom(const char* after) {
         if (!next[0]) return false;
         char path[256];
         if (snprintf(path, sizeof path, "%s\\%s", demo_dir, next) < (int)sizeof path &&
-            filebrowser_loadfile(path)) {
+            demo_rom_header_ok(path) && filebrowser_loadfile(path) &&
+            gb_init(&gb, &gb_rom_read, &gb_cart_ram_read,
+                    &gb_cart_ram_write, &gb_error, nullptr) == GB_INIT_NO_ERROR) {
             snprintf(demo_current_name, sizeof demo_current_name, "%s", next);
             demo_game_started_at = time_us_64();
             return true;
@@ -3349,7 +3381,9 @@ int main() {
             printf("E gb_init error: %u\n", (unsigned)ret);
             demo_active = demo_requested = demo_advance_pending = false;
             graphics_set_mode(TEXTMODE_DEFAULT);
-            draw_text("Invalid or unsupported Game Boy ROM", 1, 1, 12, 0);
+            draw_text(ret == GB_INIT_INVALID_CHECKSUM
+                          ? "Game Boy ROM: invalid header checksum"
+                          : "Invalid or unsupported Game Boy ROM", 1, 1, 12, 0);
             sleep_ms(1200);
             restart = false;
             continue;

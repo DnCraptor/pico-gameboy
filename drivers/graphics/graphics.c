@@ -10,7 +10,7 @@ void draw_text(const char *string, uint32_t x, uint32_t y, uint8_t color, uint8_
     for (int xi = cols - (int) x; xi--;) {
         if (!*string) break;
         *t_buf++ = *string++;
-        *t_buf++ = bgcolor << 4 | color & 0xF;
+        *t_buf++ = (uint8_t)(bgcolor << 4 | (color & 0xF));
     }
 }
 
@@ -35,7 +35,7 @@ void draw_window(const char *title, uint32_t x, uint32_t y, uint32_t width, uint
     memset(line, ' ', width);
     line[0] = line[width] = 0xBA;
 
-    for (int i = 1; i < height; i++) {
+    for (uint32_t i = 1; i < height; i++) {
         draw_text(line, x, y + i, 11, 1);
     }
 

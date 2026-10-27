@@ -23,31 +23,22 @@
 
 /* C Headers */
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <strings.h>
+#include <signal.h>
+#include <pthread.h>
 
-/* RP2040 Headers */
-#include "pico/runtime.h"
-#include <hardware/sync.h>
-#include <hardware/flash.h>
-#include <hardware/timer.h>
-#include <hardware/vreg.h>
-#if PICO_RP2350
-#include <hardware/structs/qmi.h>
-#endif
-#include <pico/stdio.h>
-#include <pico/stdlib.h>
-#include <pico/multicore.h>
-#include <pico/critical_section.h>
-#include <sys/unistd.h>
-#include <hardware/watchdog.h>
-#include <hardware/clocks.h>
+/* Linux host (src/linux): the counterparts of the RP2350 SDK and drivers */
+#include <pico.h>
+#include "hid_keys.h"
+#include "audio_linux.h"
+#include "input_linux.h"
+#include "kbd_linux.h"
+#include "platform_linux.h"
+#include "video_drm.h"
 
-#include "audio.h"
 #include "minigb_apu.h"
-#if HWAY
-#include "hway/ay_hway.h"
-#endif
 
 /* Project headers */
 #include "hedley.h"
@@ -64,100 +55,30 @@
 
 #include "nespad.h"
 
-#include "ps2kbd_mrmltr.h"
-#include "psram.h"
 
-
-/** Definition of ROM data
- * We're going to erase and reprogram a region 1Mb from the start of the flash
- * Once done, we can access this at XIP_BASE + 1Mb.
- * Game Boy DMG ROM size ranges from 32768 bytes (e.g. Tetris) to 1,048,576 bytes (e.g. Pokemod Red)
- */
 #define HOME_DIR (char*)"\\GB"
-extern char __flash_binary_end;
-#define FLASH_TARGET_OFFSET (((((uintptr_t)&__flash_binary_end - XIP_BASE) / FLASH_SECTOR_SIZE) + 4) * FLASH_SECTOR_SIZE)
-#define FLASH_ROM ((const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET))
-/* the cartridge being played: in flash, or in QSPI PSRAM when there is one */
-static const uint8_t* rom = FLASH_ROM;
+/* The configuration, the game palettes and the saved states live in
+ * /.config/gbc, apart from the games (as in pico-gamate); the settings are
+ * kept per board and video output. */
+#define CONFIG_DIR "/.config/gbc"
+#define LAST_ROM_FILE CONFIG_DIR "/last_rom"
 
-/* A ROM loaded into PSRAM survives a watchdog reset (SELECT in the browser
- * runs it again: PSRAM keeps its contents while powered).  After power-up the
- * uninitialized RAM is random, hence the magic; then the flash copy is used. */
-#define ROM_INFO_MAGIC 0x31524F47u
-static uint32_t __uninitialized_ram(rom_magic);
-static uint32_t __uninitialized_ram(rom_in_psram);
-static uint32_t __uninitialized_ram(rom_psram_size);
-
-/* Flash is an external chip, its size does not depend on the board header.
- * Read it from JEDEC ID (0x9F) like murmulator_os2: the third ID byte is
- * log2(capacity).  Called first thing in main(), before overclocking. */
-static size_t flash_bytes = PICO_FLASH_SIZE_BYTES;
-
-static void __no_inline_not_in_flash_func(detect_flash_size)() {
-    uint8_t tx[4] = { 0x9f, 0, 0, 0 };
-    uint8_t rx[4] = { 0 };
-    const uint32_t ints = save_and_disable_interrupts();
-#if PICO_RP2350
-    /* the SDK re-enters XIP with the boot-time QMI window-0 setup */
-    const uint32_t timing = qmi_hw->m[0].timing;
-    const uint32_t rfmt = qmi_hw->m[0].rfmt;
-    const uint32_t rcmd = qmi_hw->m[0].rcmd;
-#endif
-    flash_do_cmd(tx, rx, sizeof tx);
-#if PICO_RP2350
-    qmi_hw->m[0].timing = timing;
-    qmi_hw->m[0].rfmt = rfmt;
-    qmi_hw->m[0].rcmd = rcmd;
-    __asm volatile ("dsb; isb" ::: "memory");
-#endif
-    restore_interrupts(ints);
-    /* 16 MiB is the XIP window of one chip select */
-    if (rx[3] >= 20 && rx[3] <= 24)
-        flash_bytes = (size_t)1 << rx[3];
-}
-
-/* The ROM goes right after the firmware; the top 512 KB of the flash stay
- * untouched (pico-launcher lives in the last 260 KB). */
-static size_t flash_rom_capacity() {
-    const size_t end = flash_bytes - (512u << 10);
-    return end > FLASH_TARGET_OFFSET ? end - FLASH_TARGET_OFFSET : 0;
-}
+/* The cartridge being played.  On the RP2350 it is written to flash (or to
+ * QSPI PSRAM); here it is a buffer of the largest Game Boy ROM size (MBC5,
+ * 8 MiB), so the banks of a cartridge whose file is shorter than its header
+ * says read 0xFF there, like erased flash. */
+static constexpr size_t ROM_SPACE_SIZE = 8u << 20;
+static uint8_t rom_space[ROM_SPACE_SIZE];
+static const uint8_t* const rom = rom_space;
+static size_t rom_size = 0; // bytes loaded, 0 - none
 
 static bool rom_fits(const size_t size) {
-    return size != 0 && (size <= flash_rom_capacity() ||
-                         (gb_psram_available() && size <= gb_psram_size()));
-}
-
-/* the cartridge "Run previous" (SELECT) starts */
-static const uint8_t* previous_rom() {
-    if (rom_magic == ROM_INFO_MAGIC && rom_in_psram &&
-        gb_psram_available() && rom_psram_size <= gb_psram_size())
-        return (const uint8_t *)GB_PSRAM_BASE;
-    return FLASH_ROM;
-}
-
-/* All watchdog resets (Ctrl+Alt+Del) take the same route: release QMI CS1 so
- * the PSRAM does not stay in QPI mode across reset, then drop clk_sys before
- * VREG, so the boot ROM and the next firmware start at a safe clock. */
-extern "C" void __no_inline_not_in_flash_func(gb_safe_reset)(void) {
-    watchdog_enable(100, true); // failsafe in case QMI/clock transition stalls
-    save_and_disable_interrupts();
-#if PICO_RP2350
-    gb_psram_prepare_reset();
-    set_sys_clock_khz(150000, false);
-    vreg_set_voltage(VREG_VOLTAGE_1_10);
-    sleep_ms(10);
-#else
-    set_sys_clock_khz(125000, false);
-#endif
-    watchdog_reboot(0, 0, 10);
-    while (true) tight_loop_contents();
+    return size != 0 && size <= ROM_SPACE_SIZE;
 }
 
 static uint8_t ram[32768];
 
-semaphore vga_start_semaphore;
-// set by the render core once text/graphics buffers are attached to the video driver
+// set by the render thread once text/graphics buffers are attached to the video driver
 static volatile bool render_ready = false;
 
 gb_s gb;
@@ -170,18 +91,16 @@ uint32_t gb_audio_cycles = 0;
  * browser must never use a non-initialised (or failed) GB context. */
 static bool gb_initialized = false;
 /* Host heartbeat: used only by the F11 hang diagnostic.  1 = GB CPU,
- * 2 = audio, 0 = normal main loop.  Core 1 continues servicing USB while
- * core 0 is blocked, so F11 can report the last live GB state. */
+ * 2 = audio, 0 = normal main loop.  The render thread keeps reading the
+ * keyboard while the emulation is blocked, so F11 can report the last live
+ * GB state. */
 static volatile uint32_t gb_debug_frame_id = 0;
 static volatile uint8_t gb_debug_phase = 0;
-/* A failed partial SD -> PSRAM/flash write may have damaged the ROM
- * underlying a still-running GB context.  Never resume it via F10. */
-static bool rom_image_damaged = false;
 
 uint8_t SCREEN[LCD_HEIGHT][LCD_WIDTH];
 static FATFS fs;
 
-uint16_t stream[AUDIO_BUFFER_SIZE_BYTES];
+static int16_t stream[AUDIO_SAMPLES * 2]; // one Game Boy frame, stereo
 
 typedef uint32_t palette222_t[3][4];
 static palette222_t palette;
@@ -294,14 +213,13 @@ static volatile bool palette_editor_requested = false;          // F12
 static volatile bool filebrowser_toggle_requested = false;     // F10: browser / return
 
 /* R / P in the ROM browser arm a recording or its playback for the selected
- * cartridge.  Keyboard reports are produced on core 1. */
+ * cartridge.  Keyboard reports are produced on the render thread. */
 static volatile bool replay_browser_active = false;
 static volatile uint8_t replay_browser_command = 0;
 enum replay_launch_t : uint8_t { REPLAY_LAUNCH_NORMAL, REPLAY_LAUNCH_RECORD, REPLAY_LAUNCH_PLAY };
 static replay_launch_t replay_launch = REPLAY_LAUNCH_NORMAL;
 
-void
-__not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
+void process_kbd_report(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
     /*    printf("HID key report modifiers %2.2X report ", report->modifier);
         for (unsigned char i: report->keycode)
             printf("%2.2X", i);
@@ -361,7 +279,12 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
     ctrlPressed = isInReport(report, HID_KEY_CONTROL_LEFT) || isInReport(report, HID_KEY_CONTROL_RIGHT);
 
     if (altPressed && ctrlPressed && isInReport(report, HID_KEY_DELETE)) {
-        gb_safe_reset();
+        /* RP2350: watchdog reset.  Linux: the render thread restarts the
+         * emulator process. */
+        platform_request(PLATFORM_REBOOT);
+    }
+    if (altPressed && ctrlPressed && isInReport(report, HID_KEY_END)) {
+        platform_request(PLATFORM_QUIT);
     }
     if (ctrlPressed || altPressed) {
         uint8_t fxPressed = 0;
@@ -397,12 +320,6 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
             filebrowser_toggle_requested = true;
     }
 }
-
-Ps2Kbd_Mrmltr ps2kbd(
-    pio1,
-    PS2KBD_GPIO_FIRST,
-    process_kbd_report
-);
 
 enum : uint8_t {
     BTN_UP     = 1u << 0,
@@ -447,35 +364,42 @@ struct input_gate_t {
 /**
  * Returns a byte from the ROM file at the given address.
  */
-uint8_t __not_in_flash_func(gb_rom_read)(struct gb_s* gb, const uint_fast32_t addr) {
-    return rom[addr];
+uint8_t gb_rom_read(struct gb_s*, const uint_fast32_t addr) {
+    return rom[addr]; // gb_init() limits the banks to the 8 MiB of rom_space
 }
+
+/* The cartridge RAM is 32 KiB (saved states keep it in that size), the
+ * header may declare 64 or 128 KiB: the banks above 32 KiB wrap around
+ * instead of writing past ram[] (sizeof ram is a power of two). */
+static_assert((sizeof ram & (sizeof ram - 1)) == 0, "ram[] size must be a power of two");
 
 /**
  * Returns a byte from the cartridge RAM at the given address.
  */
-uint8_t __not_in_flash_func(gb_cart_ram_read)(struct gb_s* gb, const uint_fast32_t addr) {
-    return ram[addr];
+uint8_t gb_cart_ram_read(struct gb_s*, const uint_fast32_t addr) {
+    return ram[addr & (sizeof ram - 1)];
 }
 
 /**
  * Writes a given byte to the cartridge RAM at the given address.
  */
-void __not_in_flash_func(gb_cart_ram_write)(struct gb_s* gb, const uint_fast32_t addr, const uint8_t val) {
-    ram[addr] = val;
+void gb_cart_ram_write(struct gb_s*, const uint_fast32_t addr, const uint8_t val) {
+    ram[addr & (sizeof ram - 1)] = val;
 }
 
 /**
  * Ignore all errors.
  */
-void gb_error(struct gb_s* gb, const enum gb_error_e gb_err, const uint16_t addr) {
-    const char* gb_err_str[4] = {
+void gb_error(struct gb_s*, const enum gb_error_e gb_err, const uint16_t addr) {
+    const char* gb_err_str[GB_INVALID_MAX] = {
         "UNKNOWN",
         "INVALID OPCODE",
         "INVALID READ",
-        "INVALID WRITE"
+        "INVALID WRITE",
+        "HALT FOREVER"
     };
-    printf("Error %d occurred: %s at %04X\n.\n", gb_err, gb_err_str[gb_err], addr);
+    printf("Error %d occurred: %s at %04X\n.\n", gb_err,
+           gb_err < GB_INVALID_MAX ? gb_err_str[gb_err] : gb_err_str[0], addr);
 }
 
 /* The picture is triple buffered.  The emulator draws a whole frame in a few
@@ -558,7 +482,7 @@ static void demo_draw_title_overlay() {
         show_timer == last_show_timer)
         return;
 
-    char label[53];
+    char label[64]; // graphics_set_overlay() shows up to 52 characters
     if (show_title) {
         char title[45];
         const char* dot = strrchr(demo_current_name, '.');
@@ -645,7 +569,7 @@ static void cube_pal_init() {
                 cube_pal[(r * 6 + g) * 5 + b] = RGB888(r * 255 / 5, g * 255 / 5, b * 255 / 4);
 }
 
-static critical_section_t frame_lock;
+static pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int8_t frame_front = 0;    // on the screen (render core)
 static volatile int8_t frame_pending = -1; // complete, to be shown
 static int8_t frame_back = 1;              // being drawn (emulator core)
@@ -655,23 +579,23 @@ static volatile bool hw_pal_invalid = true;
 
 /* emulator core: the back buffer holds a complete frame */
 static void frame_complete() {
-    critical_section_enter_blocking(&frame_lock);
+    pthread_mutex_lock(&frame_lock);
     const int8_t done = frame_back;
     const int8_t dropped = frame_pending;
     frame_pending = done;
     frame_back = dropped >= 0 ? dropped : 3 - frame_front - done;
-    critical_section_exit(&frame_lock);
+    pthread_mutex_unlock(&frame_lock);
 }
 
-/* render core, in the vertical blank: show the pending frame */
-static void __time_critical_func(frame_show)() {
-    critical_section_enter_blocking(&frame_lock);
+/* render thread, in the vertical blank: show the pending frame */
+static void frame_show() {
+    pthread_mutex_lock(&frame_lock);
     const int8_t p = frame_pending;
     if (p >= 0) {
         frame_front = p;
         frame_pending = -1;
     }
-    critical_section_exit(&frame_lock);
+    pthread_mutex_unlock(&frame_lock);
     if (p < 0) return;
     // the emulator core writes neither this buffer nor its palette now
     if (frame_sets[p]) {
@@ -692,82 +616,56 @@ static void __time_critical_func(frame_show)() {
     graphics_set_buffer((uint8_t *)frames[p], LCD_WIDTH, LCD_HEIGHT);
 }
 
-/* Renderer loop on Pico's second core */
-void __time_critical_func(render_core)() {
-    multicore_lockout_victim_init();
-#ifdef KBDUSB
-    tuh_init(BOARD_TUH_RHPORT);
-#endif
+/* Display and controllers: what the RP2350 render core sets up before the
+ * emulation starts. */
+static bool render_init(const char* drm_device) {
     graphics_init();
-#if !(VGA || HDMI || SOFTTV)
-    // Framebuffer-only fallback (TFT): no scanout OSD and no backplane.
-    graphics_set_palette(192, RGB888(255, 255, 255)); // Demo text
-    graphics_set_palette(193, RGB888(0, 0, 0));       // Demo label background
-#endif
 
     const auto buffer = (uint8_t *)SCREEN;
     graphics_set_buffer(buffer, LCD_WIDTH, LCD_HEIGHT);
     graphics_set_textbuffer(buffer);
     graphics_set_bgcolor(0x000000);
-
-#if VGA
-    graphics_set_offset(60, 6);
-#endif
-#if HDMI | TV
     graphics_set_offset(80, 48);
-#endif
-#if SOFTTV
-    graphics_set_offset(0, 48); // the TV driver centres the picture itself, with square pixels
-#endif
-
     graphics_set_flashmode(false, false);
     graphics_set_mode(GRAPHICSMODE_DEFAULT);
-    // clrScr(1);
 
+    if (!video_drm_open(drm_device, HDMI_FRAME_WIDTH, HDMI_FRAME_HEIGHT))
+        return false;
+    input_init();
+    return true;
+}
+
+/* Renderer loop, the role of the RP2350's second core: controllers and the
+ * HDMI picture at 60 Hz.  The pending Game Boy frame (and its palette) is
+ * taken in the "vertical blank", before the next picture is composed. */
+static void* render_core(void*) {
+    static uint32_t frame_pixels[HDMI_FRAME_WIDTH * HDMI_FRAME_HEIGHT];
     render_ready = true;
-    sem_acquire_blocking(&vga_start_semaphore);
 
     // 60 FPS loop
 #define frame_tick (16666)
-    uint64_t tick = time_us_64();
-#ifdef TFT
-    uint64_t last_renderer_tick = tick;
-#endif
-    uint64_t last_input_tick = tick;
-#ifndef TFT
-    uint32_t frame_count = graphics_frame_count;
-#endif
+    uint64_t next_frame = time_us_64();
     while (true) {
-#ifdef TFT
-        if (tick >= last_renderer_tick + frame_tick) {
-            frame_show();
-            refresh_lcd();
-            last_renderer_tick = tick;
-        }
-#else
-        if (frame_count != graphics_frame_count) {
-            frame_count = graphics_frame_count; // the vertical blank of the display
-            frame_show();
-        }
-#endif
-#if HWAY
-        hway_poll(); // the AY bus belongs to this core
-#endif
-        if (tick >= last_input_tick + frame_tick * 1) {
-            ps2kbd.tick();
-            nespad_tick();
-            last_input_tick = tick;
-        }
-        tick = time_us_64();
+        input_poll(kbd_linux_event);
+        nespad_tick();
+        platform_service();
 
+        frame_show();
+        hdmi_linux_compose(frame_pixels);
+        video_drm_present(frame_pixels, HDMI_FRAME_WIDTH, HDMI_FRAME_HEIGHT);
 
-#ifdef KBDUSB
-        tuh_task();
-#endif
-        tight_loop_contents();
+        next_frame += frame_tick;
+        const uint64_t now = time_us_64();
+        if (next_frame + frame_tick < now)
+            next_frame = now; // fell behind by more than a frame: resync
+        sleep_until_us(next_frame);
     }
 
     __unreachable();
+}
+
+static void on_signal(int) {
+    platform_request(PLATFORM_QUIT);
 }
 
 
@@ -872,7 +770,7 @@ void gb_cgb_palette_changed(const uint8_t index) {
     }
 }
 
-void __always_inline lcd_draw_line(struct gb_s* gb, const uint8_t pixels[160], const uint_fast8_t y) {
+static void lcd_draw_line(struct gb_s* gb, const uint8_t pixels[160], const uint_fast8_t y) {
     uint8_t* const line = frames[frame_back][y];
     if (y == 0) frame_started = true;
     if (gb->cgb.cgbMode) {
@@ -951,25 +849,25 @@ void read_cart_ram_file(struct gb_s* gb) {
         FIL fil;
         FRESULT fr = f_open(&fil, filename, FA_READ);
         if (fr == FR_OK) {
-            f_read(&fil, ram, f_size(&fil), &br);
+            // the cartridge RAM buffer holds 32 KiB (see gb_cart_ram_read)
+            f_read(&fil, ram, f_size(&fil) < sizeof ram ? (UINT)f_size(&fil) : (UINT)sizeof ram, &br);
+            fr = f_close(&fil);
+            if (fr != FR_OK) {
+                printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
+            }
         }
         else {
             printf("E f_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr);
         }
-
-        fr = f_close(&fil);
-        if (fr != FR_OK) {
-            printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
-        }
     }
-    printf("I read_cart_ram_file(%s) COMPLETE (%u bytes)\n", filename, save_size);
+    printf("I read_cart_ram_file(%s) COMPLETE (%lu bytes)\n", filename, (unsigned long)save_size);
 }
 
 /**
  * Write a save file to the SD card
  */
 void write_cart_ram_file(struct gb_s* gb) {
-    char filename[16];
+    char filename[24];
     uint_fast32_t save_size;
     UINT bw;
 
@@ -979,18 +877,17 @@ void write_cart_ram_file(struct gb_s* gb) {
         FIL fil;
         FRESULT fr = f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
         if (fr == FR_OK) {
-            f_write(&fil, ram, save_size, &bw);
+            f_write(&fil, ram, save_size < sizeof ram ? (UINT)save_size : (UINT)sizeof ram, &bw);
+            fr = f_close(&fil);
+            if (fr != FR_OK) {
+                printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
+            }
         }
         else {
             printf("E f_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr);
         }
-
-        fr = f_close(&fil);
-        if (fr != FR_OK) {
-            printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
-        }
     }
-    printf("I write_cart_ram_file(%s) COMPLETE (%u bytes)\n", filename, save_size);
+    printf("I write_cart_ram_file(%s) COMPLETE (%lu bytes)\n", filename, (unsigned long)save_size);
 }
 
 
@@ -1016,54 +913,32 @@ int compareFileItems(const void* a, const void* b) {
     return strcmp(itemA->filename, itemB->filename);
 }
 
-bool isExecutable(const char pathname[255],const char *extensions) {
-    char *pathCopy = strdup(pathname);
-    const char* token = strrchr(pathCopy, '.');
-
-    if (token == nullptr) {
-        return false;
+/* The extension of pathname is one of the comma-separated extensions
+ * (case-insensitive).  The RP2350 version continued with strtok(NULL, ",")
+ * without a first strtok() call (undefined; glibc crashes) and matched
+ * substrings of the list ("x.c" against "gbc,gb"). */
+bool isExecutable(const char pathname[255], const char *extensions) {
+    const char* dot = strrchr(pathname, '.');
+    if (dot == nullptr || !dot[1]) return false;
+    const char* ext = dot + 1;
+    const size_t ext_len = strlen(ext);
+    for (const char* item = extensions; *item;) {
+        const char* comma = strchr(item, ',');
+        const size_t len = comma ? (size_t)(comma - item) : strlen(item);
+        if (len == ext_len && strncasecmp(item, ext, len) == 0) return true;
+        if (!comma) break;
+        item = comma + 1;
     }
-
-    token++;
-
-    while (token != NULL) {
-        if (strstr(extensions, token) != NULL) {
-            free(pathCopy);
-            return true;
-        }
-        token = strtok(NULL, ",");
-    }
-    free(pathCopy);
     return false;
 }
 
-#if PICO_RP2350
-/* flash_range_erase/program leave XIP through the boot-time XIP setup, which
- * restores the QMI window-0 timing chosen for the boot clock.  overclock()
- * runs the flash with its own timing at 378+ MHz, so the boot value would
- * clock the flash far too fast afterwards and every XIP fetch would return
- * garbage.  Keep the overclock setup; nothing runs from flash in between. */
-static void __no_inline_not_in_flash_func(flash_write_sector)(const uint32_t offset, const uint8_t* data) {
-    const uint32_t qmi_timing = qmi_hw->m[0].timing;
-    const uint32_t qmi_rfmt = qmi_hw->m[0].rfmt;
-    const uint32_t qmi_rcmd = qmi_hw->m[0].rcmd;
-    flash_range_erase(offset, FLASH_SECTOR_SIZE);
-    flash_range_program(offset, data, FLASH_SECTOR_SIZE);
-    qmi_hw->m[0].timing = qmi_timing;
-    qmi_hw->m[0].rfmt = qmi_rfmt;
-    qmi_hw->m[0].rcmd = qmi_rcmd;
-    __asm volatile ("dsb; isb" ::: "memory");
-}
-#else
-static void __no_inline_not_in_flash_func(flash_write_sector)(const uint32_t offset, const uint8_t* data) {
-    flash_range_erase(offset, FLASH_SECTOR_SIZE);
-    flash_range_program(offset, data, FLASH_SECTOR_SIZE);
-}
-#endif
+/* The ROM is read into a staging buffer first and copied into the cartridge
+ * space only when the whole file has been read: a failed load never damages
+ * the game that is still running (F10 returns to it).  The path is kept in
+ * LAST_ROM_FILE: SELECT in the browser ("Prev") runs that ROM again after a
+ * restart, as the RP2350 runs the ROM it keeps in flash. */
+static void config_mkdirs();
 
-/* QSPI PSRAM, when found, takes the ROM directly (no flash wear, no erase);
- * otherwise it goes to flash sector by sector: a sector that already holds
- * the same data is not erased again, and every written sector is verified. */
 bool filebrowser_loadfile(const char pathname[256]) {
     FIL file;
     FILINFO fileinfo;
@@ -1083,97 +958,62 @@ bool filebrowser_loadfile(const char pathname[256]) {
     if (FR_OK != f_stat(pathname, &fileinfo) || fileinfo.fsize == 0)
         return fail("ERROR: Can't read the ROM file!   ");
 
-    const size_t load_size = fileinfo.fsize;
-    const bool use_psram = gb_psram_available() && load_size <= gb_psram_size();
-    if (!use_psram && load_size > flash_rom_capacity())
+    if (!rom_fits(fileinfo.fsize))
         return fail("ERROR: ROM too large! Canceled!!  ");
+    const size_t load_size = (size_t)fileinfo.fsize;
 
     if (FR_OK != f_open(&file, pathname, FA_READ))
         return fail("ERROR: Can't open the ROM file!   ");
 
-    draw_text(use_psram ? "Loading into QSPI PSRAM..." : "Loading into Flash...",
-              window_x + 1, window_y + 2, 10, 1);
+    draw_text("Loading...", window_x + 1, window_y + 2, 10, 1);
 
-    // A read/write failure after this point leaves the old image unusable.
-    rom_image_damaged = true;
+    static uint8_t staging[ROM_SPACE_SIZE];
     size_t total_read = 0;
-    UINT bytes_read = 0;
-    bool verify_failed = false;
-
-    if (use_psram) {
-        rom_magic = 0; // the PSRAM copy is being overwritten
-        uint8_t* dst = (uint8_t *)GB_PSRAM_BASE;
-        while (total_read < load_size) {
-            const UINT chunk = load_size - total_read > 4096 ? 4096 : (UINT)(load_size - total_read);
-            if (FR_OK != f_read(&file, dst + total_read, chunk, &bytes_read) || bytes_read != chunk)
-                break;
-            total_read += bytes_read;
-        }
-    }
-    else {
-        /* the sector buffer lives in the tail of SCREEN, behind the text
-         * mode: the game redraws the whole picture anyway */
-        uint8_t* const buffer = &SCREEN[0][0] + sizeof(SCREEN) - FLASH_SECTOR_SIZE;
-#ifdef TEXTMODE_COLS_MAX
-        static_assert(TEXTMODE_COLS_MAX * TEXTMODE_ROWS * 2 + FLASH_SECTOR_SIZE <= sizeof(SCREEN),
-                      "no room for the flash sector buffer");
-#else
-        static_assert(TEXTMODE_COLS * TEXTMODE_ROWS * 2 + FLASH_SECTOR_SIZE <= sizeof(SCREEN),
-                      "no room for the flash sector buffer");
-#endif
-        static_assert(sizeof(SCREEN) % 4 == 0, "flash sector buffer must stay word aligned");
-        uint32_t target = FLASH_TARGET_OFFSET;
-        while (total_read < load_size) {
-            const UINT chunk = load_size - total_read > FLASH_SECTOR_SIZE
-                                   ? FLASH_SECTOR_SIZE : (UINT)(load_size - total_read);
-            memset(buffer, 0xff, FLASH_SECTOR_SIZE);
-            if (FR_OK != f_read(&file, buffer, chunk, &bytes_read) || bytes_read != chunk)
-                break;
-            total_read += bytes_read;
-
-            const auto* mapped = (const uint8_t *)(XIP_BASE + target);
-            if (memcmp(mapped, buffer, FLASH_SECTOR_SIZE) != 0) {
-                multicore_lockout_start_blocking();
-                const uint32_t ints = save_and_disable_interrupts();
-                flash_write_sector(target, buffer);
-                restore_interrupts(ints);
-                multicore_lockout_end_blocking();
-                if (memcmp(mapped, buffer, FLASH_SECTOR_SIZE) != 0) {
-                    verify_failed = true;
-                    break;
-                }
-            }
-            target += FLASH_SECTOR_SIZE;
-            gpio_put(PICO_DEFAULT_LED_PIN, target >> 13 & 1);
-        }
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
-        memset(buffer, 0, FLASH_SECTOR_SIZE);
+    while (total_read < load_size) {
+        const UINT chunk = load_size - total_read > 65536 ? 65536 : (UINT)(load_size - total_read);
+        UINT bytes_read = 0;
+        if (FR_OK != f_read(&file, staging + total_read, chunk, &bytes_read) || bytes_read != chunk)
+            break;
+        total_read += bytes_read;
     }
     f_close(&file);
 
-    if (verify_failed)
-        return fail("ERROR: Flash verify failed!       ");
     if (total_read != load_size)
         return fail("ERROR: ROM load failed!           ");
 
+    memcpy(rom_space, staging, load_size);
+    memset(rom_space + load_size, 0xff, ROM_SPACE_SIZE - load_size);
+    rom_size = load_size;
     {
         const char* name = pathname;
         for (const char* q = pathname; *q; q++)
             if (*q == '\\' || *q == '/') name = q + 1;
         snprintf(rom_file, sizeof rom_file, "%s", name);
     }
-    if (use_psram) {
-        rom_psram_size = load_size;
-        rom_in_psram = 1;
-        rom_magic = ROM_INFO_MAGIC;
-        rom = (const uint8_t *)GB_PSRAM_BASE;
+
+    static FIL last; // remember the ROM for SELECT ("Prev") after a restart
+    config_mkdirs();
+    if (f_open(&last, LAST_ROM_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+        UINT bw = 0;
+        f_write(&last, pathname, (UINT)strlen(pathname), &bw);
+        f_close(&last);
     }
-    else {
-        rom_in_psram = 0; // a PSRAM copy, if any, is no longer the latest ROM
-        rom = FLASH_ROM;
-    }
-    rom_image_damaged = false;
     return true;
+}
+
+/* SELECT in the browser: the ROM loaded last, from this run or the path kept
+ * in LAST_ROM_FILE.  False if there is none (or it cannot be loaded). */
+static bool previous_rom() {
+    if (rom_size) return true;
+    static FIL last;
+    if (f_open(&last, LAST_ROM_FILE, FA_READ) != FR_OK) return false;
+    char path[256];
+    UINT br = 0;
+    const bool read_ok = f_read(&last, path, sizeof path - 1, &br) == FR_OK && br > 0;
+    f_close(&last);
+    if (!read_ok) return false;
+    path[br] = '\0';
+    return filebrowser_loadfile(path);
 }
 
 /* Where the browser was left: re-entering it opens the same directory with
@@ -1238,7 +1078,7 @@ static bool demo_load_next_rom(const char* after) {
                 !rom_fits(info.fsize) || (cursor[0] && strcmp(info.fname, cursor) <= 0))
                 continue;
             if (!next[0] || strcmp(info.fname, next) < 0)
-                snprintf(next, sizeof next, "%s", info.fname);
+                strcpy(next, info.fname); // the length is checked above
         }
         f_closedir(&dir);
         if (!next[0]) return false;
@@ -1303,12 +1143,12 @@ void filebrowser(const char* executables) {
                 continue;
             }
             draw_text("Failed to open directory", 1, 1, 4, 0);
-            while (true);
+            while (true) sleep_ms(100); // Ctrl+Alt+End quits
         }
 
-        snprintf(tmp, TEXTMODE_COLS, "SD:\\%s", basepath);
+        // the window title: as much of the path as fits
+        snprintf(tmp, TEXTMODE_COLS, "SD:\\%.*s", TEXTMODE_COLS - 5, basepath);
         draw_window(tmp, 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS - 1);
-        draw_text(gb_psram_available() ? "QSPI PSRAM" : "FLASH", TEXTMODE_COLS - 11, 0, 10, 1);
         memset(tmp, ' ', TEXTMODE_COLS);
 
 
@@ -1358,7 +1198,9 @@ void filebrowser(const char* executables) {
             fileItems[total_files].is_executable = !(fileInfo.fattrib & AM_DIR) &&
                                                    rom_fits(fileInfo.fsize) &&
                                                    isExecutable(fileInfo.fname, executables);
-            strncpy(fileItems[total_files].filename, fileInfo.fname, 78);
+            // a longer name would be cut and could not be opened
+            if (strlen(fileInfo.fname) >= sizeof fileItems[total_files].filename) continue;
+            strcpy(fileItems[total_files].filename, fileInfo.fname);
             total_files++;
         }
         f_closedir(&dir);
@@ -1444,14 +1286,14 @@ void filebrowser(const char* executables) {
                 return;
             }
             if (keys & BTN_SELECT) {
-                if (rom_image_damaged) {
-                    draw_text("Previous ROM incomplete; load another", 1, 1, 12, 0);
+                if (!previous_rom()) {
+                    draw_text("No previous ROM; load one", 1, 1, 12, 0);
                     sleep_ms(1200);
-                    break; // redraw the browser, not a broken cartridge
+                    strcpy(focus, total_files ? fileItems[offset + current_item].filename : "");
+                    break; // redraw the browser
                 }
                 fb_menu_requested = false;
                 fb_remember(basepath, total_files ? fileItems[offset + current_item].filename : "");
-                rom = previous_rom();
                 fb_rom_ready = true;
                 replay_browser_active = false;
                 return;
@@ -1581,10 +1423,12 @@ void filebrowser(const char* executables) {
                         memset(tmp, 0xCD, TEXTMODE_COLS - 2);
                         tmp[TEXTMODE_COLS - 2] = '\0';
                         draw_text(tmp, 1, per_page + 1, 11, 1);
-                        snprintf(tmp, TEXTMODE_COLS - 2, " Size: %iKb, File %lu of %i ", item.size / 1024,
+                        char info[64]; // the longest numbers fit: no truncated format
+                        snprintf(info, sizeof info, " Size: %zuKb, File %i of %i ", item.size / 1024,
                                  offset + i + 1,
                                  total_files);
-                        draw_text(tmp, 2, per_page + 1, 14, 3);
+                        info[TEXTMODE_COLS - 3] = '\0'; // as wide as the frame line
+                        draw_text(info, 2, per_page + 1, 14, 3);
                     }
 
                     const auto len = strlen(item.filename);
@@ -1625,59 +1469,21 @@ enum menu_type_e {
 
 typedef bool (*menu_callback_t)();
 
+/* the fields an item leaves out are empty (separators, plain actions) */
 typedef struct __attribute__((__packed__)) {
-    const char* text;
-    menu_type_e type;
-    const void* value;
-    menu_callback_t callback;
-    uint8_t max_value;
-    char value_list[49][18];
+    const char* text = "";
+    menu_type_e type = NONE;
+    const void* value = nullptr;
+    menu_callback_t callback = nullptr;
+    uint8_t max_value = 0;
+    char value_list[49][18] = {};
 } MenuItem;
 
 static int save_slot = 0;
-#ifndef CPU_FREQ
-#define CPU_FREQ 378
-#endif
-#define FREQ_STR_(x) #x
-#define FREQ_STR(x) FREQ_STR_(x)
-static uint16_t frequencies[] = { CPU_FREQ, 396, 404, 408, 412, 416, 420, 424, 433 };
-static uint8_t frequency_index = 0;
-
-bool overclock() {
-#if PICO_RP2350
-    volatile uint32_t *qmi_m0_timing=(uint32_t *)0x400d000c;
-    vreg_disable_voltage_limit();
-    vreg_set_voltage(VREG_VOLTAGE_1_60);
-    sleep_ms(10);
-    *qmi_m0_timing = 0x60007204;
-    set_sys_clock_khz(frequencies[frequency_index] * KHZ, false);
-    *qmi_m0_timing = 0x60007303;
-    gb_psram_reclock(); // QMI CS1 timing depends on clk_sys (no-op without PSRAM)
-    return true;
-#else
-    hw_set_bits(&vreg_and_chip_reset_hw->vreg, VREG_AND_CHIP_RESET_VREG_VSEL_BITS);
-    sleep_ms(33);
-    return set_sys_clock_khz(frequencies[frequency_index] * KHZ, true);
-#endif
-}
-
-/* The configuration, the game palettes and the saved states live in
- * /.config/gbc, apart from the games (as in pico-gamate); the settings are
- * kept per board and video output. */
-#define CONFIG_DIR "/.config/gbc"
-
+/* settings of this build: /.config/gbc/orange/hdmi (the RP2350 boards have
+ * their own directories, e.g. m1p2/hdmi) */
 static const char* config_platform_name() {
-#ifdef PICO_RP2350
-    if (strcmp(PICO_BOARD, "murmulator2") == 0) return "m2p2";
-    if (strcmp(PICO_BOARD, "olimex-pico-pc") == 0) return "pcp2";
-    if (strcmp(PICO_BOARD, "waveshare_rp2350_pizero") == 0) return "z0p2";
-    return "m1p2";
-#else
-    if (strcmp(PICO_BOARD, "murmulator2") == 0) return "m2p1";
-    if (strcmp(PICO_BOARD, "olimex-pico-pc") == 0) return "pcp1";
-    if (strcmp(PICO_BOARD, "waveshare_rp2040_pizero") == 0) return "z0p1";
-    return "m1p1";
-#endif
+    return "orange";
 }
 
 static const char* config_video_name() {
@@ -1982,7 +1788,28 @@ static bool load() {
     // Old save files have just gb + RAM; new ones append the replay marker.
     if (f_size(&fd) < sizeof gb + sizeof ram) { f_close(&fd); return false; }
     UINT br = 0;
+    /* The state is the whole context, its function pointers too.  Keep this
+     * process's ones: another run of the program has its code at other
+     * addresses (ASLR), a stale pointer from the file would crash it. */
+    const auto rom_read = gb.gb_rom_read;
+    const auto cart_ram_read = gb.gb_cart_ram_read;
+    const auto cart_ram_write = gb.gb_cart_ram_write;
+    const auto error = gb.gb_error;
+    const auto serial_tx = gb.gb_serial_tx;
+    const auto serial_rx = gb.gb_serial_rx;
+    const auto bootrom_read = gb.gb_bootrom_read;
+    const auto draw_line = gb.display.lcd_draw_line;
+    void* const priv = gb.direct.priv;
     const bool gb_ok = f_read(&fd, &gb, sizeof gb, &br) == FR_OK && br == sizeof gb;
+    gb.gb_rom_read = rom_read;
+    gb.gb_cart_ram_read = cart_ram_read;
+    gb.gb_cart_ram_write = cart_ram_write;
+    gb.gb_error = error;
+    gb.gb_serial_tx = serial_tx;
+    gb.gb_serial_rx = serial_rx;
+    gb.gb_bootrom_read = bootrom_read;
+    gb.display.lcd_draw_line = draw_line;
+    gb.direct.priv = priv;
     const bool ram_ok = gb_ok && f_read(&fd, ram, sizeof ram, &br) == FR_OK && br == sizeof ram;
     replay_state_t replay_state = {};
     const bool marker_ok = ram_ok &&
@@ -2014,9 +1841,9 @@ static uint8_t screen_scale = 1;
 #else
 static uint8_t screen_scale = 0;
 #endif
-/* HDMI / VGA / TV-SOFT on RP2350: the Game Boy Color picture around the game
- * in 2x and 3x (the cells take 75 KB of RAM - no room on RP2040) */
-#if (VGA || HDMI || SOFTTV) && PICO_RP2350
+/* HDMI / VGA / TV-SOFT: the Game Boy Color picture around the game in 2x
+ * and 3x (on the RP2350 builds only: the cells take 75 KB of RAM) */
+#if VGA || HDMI || SOFTTV
 #define BACKPLANE 1
 static uint8_t backplane = 1;
 
@@ -2271,7 +2098,7 @@ static void update_palette() {
             // AUTO / a GBC boot palette: the colours this palette gets there
             if (!gbc_palette_ready || gbc_palette_of != sel) {
                 if (sel == PALETTE_AUTO) {
-                    char rom_title[16];
+                    char rom_title[24];
                     auto_assign_palette(palette16, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title));
                 }
                 else {
@@ -2479,11 +2306,11 @@ static void pe_draw(uint8_t* buf, const unsigned selected, const int edit_channe
             memset(buf + y * LCD_WIDTH + x0, layer_hw[slot >> 2] * 4 + (slot & 3), PE_W);
 
         const uint8_t text = pe_contrast(slot);
-        char label[8];
+        char label[16];
         snprintf(label, sizeof label, "%s %u", names[slot >> 2], slot & 3);
         pe_text(buf, x0 + (PE_W - (int)strlen(label) * 4 + 1) / 2, y0 + 15, label, text);
         char rgb[8];
-        snprintf(rgb, sizeof rgb, "%06lX", (unsigned long)pal_rgb[slot >> 2][slot & 3]);
+        snprintf(rgb, sizeof rgb, "%06lX", (unsigned long)(pal_rgb[slot >> 2][slot & 3] & 0xFFFFFFu));
         pe_text(buf, x0 + 8, y0 + 26, rgb, text);
 
         if (slot == selected) { // the focus frame
@@ -2942,16 +2769,12 @@ const MenuItem menu_items[] = {
     { "Gray level: %s", ARRAY, &gray_level, nullptr, 3, { "0", "1", "2", "3" } },
 #endif
     {},
-{
-    "Overclocking: %s MHz", ARRAY, &frequency_index, &overclock, count_of(frequencies) - 1,
-    { FREQ_STR(CPU_FREQ), "396", "404", "408", "412", "416", "420", "424", "432" }
-},
-{ "Press START / Enter to apply", NONE },
     { "Start Demo", START_DEMO },
     { "Reset to ROM select", ROM_SELECT },
     { "Return to game", RETURN }
 };
 #define MENU_ITEMS_NUMBER (sizeof(menu_items) / sizeof (MenuItem))
+static_assert(MENU_ITEMS_NUMBER <= TEXTMODE_ROWS, "the menu does not fit the text mode");
 
 /* key=value text: a new key never invalidates an existing file */
 static void config_path(char* pathname, const size_t size) {
@@ -3089,7 +2912,7 @@ void menu() {
 #endif
     graphics_set_mode(TEXTMODE_DEFAULT);
     menu_frame();
-    uint current_item = 0;
+    unsigned current_item = 0;
     /* Only fresh presses count: the Start+Select that opened the menu must be
      * released first, so it can't change or activate the first item. */
     uint8_t prev_keys = input_held();
@@ -3101,8 +2924,8 @@ void menu() {
         const bool activate = pressed & BTN_START;
         const bool dmg = gb_initialized && !gb.cgb.cgbMode; // only a loaded DMG game
 
-        for (int i = 0; i < MENU_ITEMS_NUMBER; i++) {
-            uint8_t y = i + (TEXTMODE_ROWS - MENU_ITEMS_NUMBER >> 1);
+        for (unsigned i = 0; i < MENU_ITEMS_NUMBER; i++) {
+            uint8_t y = i + ((TEXTMODE_ROWS - MENU_ITEMS_NUMBER) >> 1);
             uint8_t x = TEXTMODE_COLS / 2 - 10;
             uint8_t color = 0xFF;
             uint8_t bg_color = 0x00;
@@ -3210,6 +3033,7 @@ void menu() {
                     break;
                 case NONE:
                     color = 6;
+                    [[fallthrough]];
                 default:
                     snprintf(result, TEXTMODE_COLS, "%s", item->text);
             }
@@ -3242,11 +3066,10 @@ void menu() {
     graphics_set_mode(GRAPHICSMODE_DEFAULT);
 }
 
-#if HWAY
-/* Without the I2S DMA nothing waits for the sound: keep the Game Boy frame
- * rate (70224 cycles of 4194304 Hz = 16742.7 us) by the timer.  After a
- * stop (menu, file browser, slow frames) the count starts again. */
-static void hway_frame_wait() {
+/* Without a sound device nothing waits for the sound: keep the Game Boy
+ * frame rate (70224 cycles of 4194304 Hz = 16742.7 us) by the timer.  After
+ * a stop (menu, file browser, slow frames) the count starts again. */
+static void timer_frame_wait() {
     static uint64_t t0;
     static uint32_t frames;
     const uint64_t now = time_us_64();
@@ -3256,58 +3079,55 @@ static void hway_frame_wait() {
         frames = 0;
         return;
     }
-    while (time_us_64() < target) tight_loop_contents();
+    sleep_until_us(target);
     if (++frames >= 4194304u) { // keep the product in range: restart from here
         t0 = target;
         frames = 0;
     }
 }
-#endif
 
-int main() {
-    detect_flash_size();
-    overclock();
-    /* QMI CS1 setup before core1 starts: the probe briefly blocks XIP */
-    gb_psram_init();
+int main(int argc, char** argv) {
+    /* gameboy [data directory [DRM device]]: the data directory plays the
+     * role of the SD card (GB\ ROMs, .config\gbc\ settings and states). */
+    const char* root = argc > 1 ? argv[1] : ".";
+    const char* drm_device = argc > 2 ? argv[2] : "/dev/dri/card0";
+    platform_set_argv(argv);
+    ff_set_root(root);
 
-    ps2kbd.init_gpio();
-    nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
-
-    sem_init(&vga_start_semaphore, 0, 1);
-    critical_section_init(&frame_lock);
     cube_pal_init();
     blend_slots_init();
-    multicore_launch_core1(render_core);
-    sem_release(&vga_start_semaphore);
-    // Do not draw before the video driver has its text buffer:
-    // draw_text() into a NULL text_buffer is lost.
-    while (!render_ready) tight_loop_contents();
-
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    for (int i = 0; i < 6; i++) {
-        sleep_ms(33);
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
-        sleep_ms(33);
-        gpio_put(PICO_DEFAULT_LED_PIN, false);
+    if (!render_init(drm_device)) {
+        input_shutdown();
+        video_drm_close();
+        return EXIT_FAILURE;
     }
 
-#if HWAY
-    hway_init(); // the AY chips play the sound, nothing paces the emulator
-#else
-    // Initialize I2S sound driver
-    i2s_config_t i2s_config = i2s_get_default_config();
-    i2s_config.sample_freq = AUDIO_SAMPLE_RATE;
-    i2s_config.dma_trans_count = AUDIO_SAMPLES;
-    i2s_volume(&i2s_config, 0);
-    i2s_init(&i2s_config);
-#endif
+    struct sigaction sa = {};
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+
+    // Sound: the I2S output of the RP2350 build; it paces the emulation.
+    alsa_open(AUDIO_SAMPLE_RATE);
+
+    pthread_t render_thread;
+    if (pthread_create(&render_thread, nullptr, render_core, nullptr) != 0) {
+        perror("render thread");
+        input_shutdown();
+        alsa_close();
+        video_drm_close();
+        return EXIT_FAILURE;
+    }
+    // Do not draw before the video driver has its text buffer:
+    // draw_text() into a NULL text_buffer is lost.
+    while (!render_ready) sleep_ms(1);
 
     FRESULT fr = f_mount(&fs, "", 1);
     if (FR_OK != fr) {
         printf("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-        /// TODO: error handling
-        while(1);
+        platform_request(PLATFORM_QUIT);
+        while (true) sleep_ms(100);
     } else {
         f_mkdir(HOME_DIR);
         f_load_conf();
@@ -3433,7 +3253,7 @@ int main() {
                 demo_active = false;
                 demo_advance_pending = false;
                 // FatFs replay file must be closed before the ROM browser or
-                // its PSRAM/flash loader touches the SD card.
+                // its ROM loader touches the SD card.
                 replay_stop();
                 graphics_set_mode(TEXTMODE_DEFAULT);
 #if BACKPLANE
@@ -3443,14 +3263,6 @@ int main() {
 #endif
                 fb_can_cancel = false;
                 graphics_set_mode(GRAPHICSMODE_DEFAULT);
-                if (fb_canceled && rom_image_damaged) {
-                    // A failed ROM replacement may have overwritten the game's
-                    // PSRAM/flash bytes.  Returning to it would run corrupt code.
-                    fb_canceled = false;
-                    demo_active = demo_requested = demo_advance_pending = false;
-                    restart = true;
-                    break;
-                }
                 if (fb_canceled) {
                     fb_canceled = false;
                     demo_active = was_demo;
@@ -3549,27 +3361,18 @@ int main() {
 
             //-----------------------------------------------------------------
             gb_debug_phase = 1;
-#if !HWAY
             gb_audio_cycles = 0;
-            audio_frame_begin(reinterpret_cast<int16_t *>(stream));
-#endif
+            audio_frame_begin(stream);
             gb_run_frame(&gb);
             gb_debug_phase = 2;
-#if !HWAY
             audio_frame_end();
-#endif
             replay_end_frame();
 
             //gb.direct.interlace = 1;
 
             if (!gb.direct.frame_skip) {
-#if HWAY
-                audio_callback(NULL, reinterpret_cast<int16_t *>(stream), AUDIO_BUFFER_SIZE_BYTES);
-                audio_hway_update();
-                hway_frame_wait();
-#else
-                i2s_dma_write(&i2s_config, reinterpret_cast<const int16_t *>(stream));
-#endif
+                if (!alsa_write(stream, AUDIO_SAMPLES))
+                    timer_frame_wait();
             }
             gb_debug_phase = 0;
             ++gb_debug_frame_id;

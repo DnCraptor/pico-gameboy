@@ -25,8 +25,6 @@ extern "C" {
 
 
 #include "font6x8.h"
-#include "font8x8.h"
-#include "font8x16.h"
 
 enum graphics_mode_t {
     TEXTMODE_DEFAULT,

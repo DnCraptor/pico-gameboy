@@ -1383,7 +1383,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			fixPaletteTemp = (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) + (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)]);
 			gb->cgb.fixPalette[((gb->cgb.BGPaletteID & 0x3E) >> 1)] = RGB555_TO_RGB888(((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10));  // swap Red and Blue
 			gb_cgb_palette_changed((gb->cgb.BGPaletteID & 0x3E) >> 1);
-			if(gb->cgb.BGPaletteInc) gb->cgb.BGPaletteID = (++gb->cgb.BGPaletteID) & 0x3F;
+			if(gb->cgb.BGPaletteInc) gb->cgb.BGPaletteID = (gb->cgb.BGPaletteID + 1) & 0x3F;
 			return;
 
 		/* CGB OAM Palette Index*/
@@ -1399,7 +1399,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = RGB555_TO_RGB888(((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10));  // swap Red and Blue
 			gb_cgb_palette_changed(0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1));
-			if(gb->cgb.OAMPaletteInc) gb->cgb.OAMPaletteID = (++gb->cgb.OAMPaletteID) & 0x3F;
+			if(gb->cgb.OAMPaletteInc) gb->cgb.OAMPaletteID = (gb->cgb.OAMPaletteID + 1) & 0x3F;
 			return;
 
 		/* CGB WRAM Bank*/
@@ -3803,11 +3803,13 @@ void __gb_step_cpu(struct gb_s *gb)
 
 		/* LCD Timing */
 #if PEANUT_FULL_GBC_SUPPORT
-        if (inst_cycles > 1)
-            gb->counter.lcd_count += (inst_cycles >> gb->cgb.doubleSpeed);
-        else
-#endif
+		if (inst_cycles > 1)
+			gb->counter.lcd_count += (inst_cycles >> gb->cgb.doubleSpeed);
+		else
+			gb->counter.lcd_count += inst_cycles;
+#else
 		gb->counter.lcd_count += inst_cycles;
+#endif
 
 		/* New Scanline */
 		if(gb->counter.lcd_count >= LCD_LINE_CYCLES)
@@ -3955,7 +3957,7 @@ uint_fast32_t gb_get_save_size(struct gb_s *gb)
 	const uint_fast16_t ram_size_location = 0x0149;
 	const uint_fast32_t ram_sizes[] =
 	{
-		0x00, 0x800, 0x2000, 0x8000, 0x20000
+		0x00, 0x800, 0x2000, 0x8000, 0x20000, 0x10000
 	};
 	uint8_t ram_size = gb->gb_rom_read(gb, ram_size_location);
 
@@ -4189,6 +4191,13 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 			return GB_INIT_CARTRIDGE_UNSUPPORTED;
 	}
 
+	/* ROM and RAM size codes index the tables below (and ram_sizes[] of
+	 * gb_get_save_size()): other values would read past them. */
+	if(gb->gb_rom_read(gb, bank_count_location) >=
+			sizeof(num_rom_banks_mask) / sizeof(num_rom_banks_mask[0]) ||
+	   gb->gb_rom_read(gb, ram_size_location) >= sizeof(num_ram_banks))
+		return GB_INIT_CARTRIDGE_UNSUPPORTED;
+
 	gb->cart_ram = cart_ram[gb->gb_rom_read(gb, mbc_location)];
 	gb->num_rom_banks_mask = num_rom_banks_mask[gb->gb_rom_read(gb, bank_count_location)] - 1;
 	gb->num_ram_banks = num_ram_banks[gb->gb_rom_read(gb, ram_size_location)];
@@ -4208,11 +4217,14 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 const char* gb_get_rom_name(struct gb_s* gb, char *title_str)
 {
 	uint_fast16_t title_loc = 0x134;
-	/* End of title may be 0x13E for newer games. */
-	//const uint_fast16_t title_end = 0x14в;
+	/* The name runs up to the first zero byte, past the 16-byte title
+	 * (0x134..0x143) if it has none; at most 23 characters, so a buffer of
+	 * 24 bytes always holds it.  (The condition "title_loc <= title_loc + 24"
+	 * was always true: the name ran to any zero byte of the ROM.) */
+	const uint_fast16_t title_end = 0x134 + 23;
 	const char* title_start = title_str;
 
-	for(; title_loc <= title_loc+ 24; title_loc++)
+	for(; title_loc < title_end; title_loc++)
 	{
 		const char title_char = gb->gb_rom_read(gb, title_loc);
         if (title_char == '\0') break;
@@ -4415,7 +4427,7 @@ uint8_t gb_colour_hash(struct gb_s *gb);
  * Returns the title of ROM.
  *
  * \param gb	An initialised emulator context. Must not be NULL.
- * \param title_str Allocated string at least 16 characters.
+ * \param title_str Allocated string of at least 24 characters.
  * \returns	Pointer to start of string, null terminated.
  */
 const char* gb_get_rom_name(struct gb_s* gb, char *title_str);

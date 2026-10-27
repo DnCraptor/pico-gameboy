@@ -1,221 +1,88 @@
-# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
-if(WIN32)
-    set(USERHOME $ENV{USERPROFILE})
-else()
-    set(USERHOME $ENV{HOME})
-endif()
-set(sdkVersion 2.2.0)
-set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.2.0)
-set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
-if (EXISTS ${picoVscode})
-    include(${picoVscode})
-endif()
-# ====================================================================================
-cmake_minimum_required(VERSION 3.13...3.23)
-set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards )
-set(PICO_PLATFORM "rp2350" CACHE STRING "Chip type")
-#set(PICO_PLATFORM "rp2040" CACHE STRING "Chip type")
-#set(PICO_BOARD "murmulator" CACHE STRING "Board type")
-#set(PICO_BOARD "olimex-pico-pc" CACHE STRING "Board type")
-set(PICO_BOARD "murmulator2" CACHE STRING "Board type")
-#set(PICO_BOARD "waveshare_rp2350_pizero" CACHE STRING "Board type")
+cmake_minimum_required(VERSION 3.16)
+# orange branch: Linux ARM64 port (Orange Pi Zero 2W) - DRM/KMS video,
+# ALSA sound, evdev keyboards and game controllers.  The RP2350 firmware
+# is built from the master branch.
+project(gameboy-color VERSION 3.1.9 LANGUAGES C CXX)
 
-option(USB_HID "USB keyboard on the native USB port (TinyUSB host)" ON)
-if(${PICO_BOARD} MATCHES "waveshare_rp2350_pizero")
-    # Waveshare RP2350-PiZero (z0p2): RP2350B, 16 MB flash, HDMI on GPIO32..39,
-    # sound through an I2S module (PCM5102A) on GP10..12, USB keyboard.
-    set(PICO_FLASH_SIZE_BYTES 16777216 CACHE STRING "" FORCE)
-    set(HDMI ON CACHE BOOL "Enable HDMI display" FORCE)
-    set(USB_HID ON CACHE BOOL "USB keyboard on the native USB port (TinyUSB host)" FORCE)
-endif()
-if(${PICO_BOARD} MATCHES "olimex-pico-pc")
-    set(USB_HID ON CACHE BOOL "USB keyboard on the native USB port (TinyUSB host)" FORCE)
-endif()
-include(pico_sdk_import.cmake)
-
-project(gameboy-color C CXX ASM)
-# one place for the version: menu footer (PICO_PROGRAM_VERSION_STRING),
-# binary info and the output file name
+# one place for the version: menu footer (PICO_PROGRAM_VERSION_STRING)
 set(PICO_GAMEBOY_VERSION "3.1.9")
-SET(BUILD_NAME "${PROJECT_NAME}")
-
-option(I2S "Enable I2S sound" OFF)
-option(HWAY "Sound on hardware AY-3-8910 chips (HWAY / TurboSound, Murmulator 1.x)" OFF)
-option(I2S_CS4334 "Enable I2S CS4334 sound" OFF)
-option(VGA "Enable VGA" OFF)
-option(TFT "Enable TFT display" OFF)
-option(ILI9341 "Enable TFT ILI9341 display" OFF)
-option(HDMI "Enable HDMI display" OFF)
-option(TV "Enable TV composite output" OFF)
-option(SOFTTV "Enable TV soft composite output" OFF)
-if( ${PICO_PLATFORM} MATCHES "rp2350" )
-option(m1p2launcher "Enable m1p2-launcher support" OFF)
-endif()
-
-#set(m1p2launcher ON)
-#set(HWAY ON)
-set(I2S ON)
-#set(TFT ON)
-#set(ILI9341 ON)
-set(HDMI ON)
-#set(TV ON)
-#set(SOFTTV ON)
-set(USB_HID ON)
 
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}  -funroll-loops -ffast-math -feliminate-unused-debug-types -ffunction-sections -fdata-sections -O2")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -funroll-loops -ffast-math -feliminate-unused-debug-types -ffunction-sections -fdata-sections -O2")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_C_FLAGS_RELEASE "-O2 -g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g")
 
-pico_sdk_init()
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
+pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+find_package(Threads REQUIRED)
 
-set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/${PICO_PLATFORM}/${CMAKE_BUILD_TYPE}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
+add_executable(gameboy
+    # Emulator (Peanut-GB core in inc/peanut_gb.h, APU)
+    src/main.cpp
+    ext/minigb_apu/minigb_apu.c
 
-add_subdirectory(drivers/fatfs)
-add_subdirectory(drivers/sdcard)
-add_subdirectory(drivers/ps2kbd)
-add_subdirectory(drivers/nespad)
-add_subdirectory(drivers/audio)
+    # Text output and backplane, shared with the RP2350 build
+    drivers/graphics/graphics.c
+    drivers/graphics/backplane.c
 
-add_subdirectory(drivers/vga-nextgen)
-add_subdirectory(drivers/hdmi)
-add_subdirectory(drivers/st7789)
-add_subdirectory(drivers/tv)
-add_subdirectory(drivers/tv-software)
-
-add_subdirectory(drivers/graphics)
-
-add_executable(${PROJECT_NAME}
-        ext/minigb_apu/minigb_apu.c
-        src/main.cpp
-        src/hid_app.cpp
-        src/psram.c
+    # Linux host (counterparts of the RP2350 drivers)
+    src/linux/hdmi_linux.c      # HDMI scanline composer (drivers/hdmi)
+    src/linux/video_drm.c       # DRM/KMS output
+    src/linux/audio_linux.c     # ALSA output (I2S)
+    src/linux/input_linux.c     # evdev keyboards and gamepads (PS/2, USB HID, NES pad)
+    src/linux/kbd_linux.cpp     # key events -> HID keyboard reports
+    src/linux/ff_posix.c        # FatFs API over the data directory (SD card)
+    src/linux/platform_linux.c  # reboot / quit
 )
 
-
-if( ${PICO_PLATFORM} MATCHES "rp2040" )
-	pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
-	target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
-	pico_set_boot_stage2(${PROJECT_NAME} slower_boot2)
-	if ( ${PICO_BOARD} MATCHES "murmulator2")
-		SET(BUILD_NAME "m2p1-${PROJECT_NAME}")
-	elseif ( ${PICO_BOARD} MATCHES "olimex-pico-pc")
-		SET(BUILD_NAME "PCp1-${PROJECT_NAME}")
-	else()
-		SET(BUILD_NAME "m1p1-${PROJECT_NAME}")
-	endif()
-else()
-    if (m1p2launcher)
-		pico_set_linker_script(${PROJECT_NAME} "${CMAKE_SOURCE_DIR}/memmap.ld")
-	endif()
-	if ( ${PICO_BOARD} MATCHES "murmulator2")
-		SET(BUILD_NAME "m2p2-${PROJECT_NAME}")
-	elseif ( ${PICO_BOARD} MATCHES "olimex-pico-pc")
-		SET(BUILD_NAME "PCp2-${PROJECT_NAME}")
-	elseif ( ${PICO_BOARD} MATCHES "waveshare_rp2350_pizero")
-		SET(BUILD_NAME "z0p2-${PROJECT_NAME}")
-	else()
-		SET(BUILD_NAME "m1p2-${PROJECT_NAME}")
-	endif()
-endif()
-
-if ( ${PICO_BOARD} MATCHES "murmulator2")
-	pico_set_program_name(gameboy-color "Gameboy emulator by xrip for MURMULATOR 2.0 board")
-elseif ( ${PICO_BOARD} MATCHES "olimex-pico-pc")
-	pico_set_program_name(gameboy-color "Gameboy emulator by xrip for Olimex RP2040-PICO-PC")
-elseif ( ${PICO_BOARD} MATCHES "waveshare_rp2350_pizero")
-	pico_set_program_name(gameboy-color "Gameboy emulator by xrip for Waveshare RP2350-PiZero")
-else()
-	pico_set_program_name(gameboy-color "Gameboy emulator by xrip for MURMULATOR 1.x board")
-endif()
-pico_set_program_version(gameboy-color "${PICO_GAMEBOY_VERSION}")
-
-target_include_directories(${PROJECT_NAME} PRIVATE
-        src
-        inc
-        ext/minigb_apu
+# src/linux first: its pico.h, pico/*.h, hdmi.h, nespad.h, ff.h and f_util.h
+# replace the Pico SDK and RP2350 driver headers.
+target_include_directories(gameboy PRIVATE
+    src/linux
+    src
+    inc
+    ext/minigb_apu
+    drivers/graphics
 )
 
-IF(TFT)
-    target_link_libraries(${PROJECT_NAME} PRIVATE st7789)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE TFT)
-    SET(BUILD_NAME "${BUILD_NAME}-TFT")
-    IF(ILI9341)
-        SET(BUILD_NAME "${BUILD_NAME}-ILI9341")
-        target_compile_definitions(${PROJECT_NAME} PRIVATE ILI9341)
-    ELSE()
-        SET(BUILD_NAME "${BUILD_NAME}-ST7789")
-    ENDIF()
-ELSEIF(HDMI)
-    target_link_libraries(${PROJECT_NAME} PRIVATE hdmi)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE HDMI)
-    SET(BUILD_NAME "${BUILD_NAME}-HDMI")
-ELSEIF(TV)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE TV)
-    target_link_libraries(${PROJECT_NAME} PRIVATE tv)
-    SET(BUILD_NAME "${BUILD_NAME}-TV")
-ELSEIF(SOFTTV)
-	target_compile_definitions(${PROJECT_NAME} PRIVATE SOFTTV)
-	target_link_libraries(${PROJECT_NAME} PRIVATE tv-software)
-	SET(BUILD_NAME "${BUILD_NAME}-TV-SOFT")
-ELSE()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE VGA)
-    target_link_libraries(${PROJECT_NAME} PRIVATE vga-nextgen)
-    SET(BUILD_NAME "${BUILD_NAME}-VGA")
-ENDIF()
-
-IF(HWAY)
-    if (NOT ${PICO_BOARD} STREQUAL "murmulator")
-        message(FATAL_ERROR "HWAY: the AY bus is wired on Murmulator 1.x only")
-    endif()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE HWAY=1)
-    target_sources(${PROJECT_NAME} PRIVATE src/hway/ay_hway.c)
-    SET(BUILD_NAME "${BUILD_NAME}-AY-3-8910")
-ELSEIF(NOT I2S)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE AUDIO_PWM)
-    SET(BUILD_NAME "${BUILD_NAME}-PWM")
-ELSEIF(I2S_CS4334)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE I2S_CS4334)
-    SET(BUILD_NAME "${BUILD_NAME}-I2S-CS4334")
-ELSE()
-    SET(BUILD_NAME "${BUILD_NAME}-I2S")
-ENDIF()
-
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BUILD_NAME}-${PICO_GAMEBOY_VERSION}")
-
-target_link_libraries(${PROJECT_NAME} PRIVATE
-        audio
-        graphics
-
-        ps2kbd
-        sdcard
-        fatfs
-        nespad
-
-        pico_runtime
-        pico_stdlib
-        pico_stdio
-        pico_bootrom
-        pico_multicore
-        pico_stdio
-        pico_multicore
-        hardware_pwm
-
-        tinyusb_board
+target_compile_definitions(gameboy PRIVATE
+    _POSIX_C_SOURCE=200809L
+    _DEFAULT_SOURCE=1
+    ORANGE_GB=1
+    HDMI=1
+    PICO_PROGRAM_NAME="Gameboy emulator by xrip for Orange Pi Zero 2W"
+    PICO_PROGRAM_VERSION_STRING="${PICO_GAMEBOY_VERSION}"
 )
 
-if (USB_HID)
-	# USB keyboard on the native USB port (TinyUSB host, src/hid_app.cpp):
-	# Olimex PICO-PC and Waveshare RP2350-PiZero. PS/2 keeps working too.
-	target_compile_definitions(${PROJECT_NAME} PRIVATE KBDUSB)
-	target_link_libraries(${PROJECT_NAME} PRIVATE tinyusb_host)
-else()
-	target_link_libraries(${PROJECT_NAME} PRIVATE tinyusb_device)
-endif()
+target_compile_options(gameboy PRIVATE
+    -Wall
+    -Wextra
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+)
 
-target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data-sections)
-pico_add_extra_outputs(${PROJECT_NAME})
+target_link_libraries(gameboy PRIVATE PkgConfig::LIBDRM PkgConfig::ALSA Threads::Threads)
+install(TARGETS gameboy RUNTIME DESTINATION bin)
+
+# Debian binary package. Dependencies are derived from the actual linked ELF
+# on the build machine (e.g. libdrm2 and the distribution's ALSA library).
+install(FILES README.md DESTINATION share/doc/pico-gameboy)
+
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME "pico-gameboy")
+set(CPACK_PACKAGE_VENDOR "DnCraptor")
+set(CPACK_PACKAGE_CONTACT "DnCraptor")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Game Boy / Game Boy Color emulator using Linux DRM/KMS and ALSA")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/DnCraptor/pico-gameboy")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_DEBIAN_PACKAGE_SECTION "games")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+set(CPACK_STRIP_FILES ON)
+include(CPack)

@@ -211,6 +211,13 @@ static uint32_t custom_rgb[LAYER_COUNT][4] = {
     {0xCCFFFF, 0xFFB266, 0xCC0066, 0x663300},
     {0xCCFFFF, 0xFFB266, 0xCC0066, 0x663300},
 };
+/* User-supplied 4x4 shades (current shade * 4 + previous shade). */
+static uint32_t custom_shades16[16] = {
+    0xF0F0F0, 0xE0E0E0, 0xD0D0D0, 0xC0C0C0,
+    0xB0B0B0, 0xA0A0A0, 0x909090, 0x808080,
+    0x707070, 0x606060, 0x505050, 0x404040,
+    0x303030, 0x202020, 0x101010, 0x000000
+};
 static bool game_ini_linked = false;
 static char rom_file[80] = "";      // the ROM file name, for the game palette
 
@@ -226,7 +233,8 @@ static uint8_t demo_timer_osd = 1; // keep the countdown visible for the entire 
 static char demo_dir[256] = "";
 static char demo_current_name[80] = "";
 static constexpr uint16_t demo_seconds[] = {15, 30, 45, 60, 120, 180, 300, 600};
-/* 0: legacy 4-shade palette; 1..16: exact 16-entry preset from the worksheet. */
+static constexpr uint8_t PALETTE16_CUSTOM = GB_PALETTES16_COUNT + 1;
+/* 0: 4-shade palette; 1..16: worksheet presets; 17: imported CUSTOM. */
 static uint8_t palette16_select = 0;
 static uint8_t palette16_global = 0;
 
@@ -1275,6 +1283,13 @@ static bool demo_begin() {
  * previous one (SELECT). */
 static bool gbbp_try_install(const char* pathname); // a .gbbp file: install it as the backplane
 
+enum palette_import_result_e { PAL_IMPORT_12, PAL_IMPORT_16, PAL_IMPORT_FORMAT, PAL_IMPORT_IO };
+static palette_import_result_e import_palette_file(const char* pathname);
+static bool is_palette_text_file(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot && (!strcasecmp(dot, ".txt") || !strcasecmp(dot, ".csv"));
+}
+
 void filebrowser(const char* executables) {
     input_gate_t gate;
     char basepath[256];
@@ -1356,8 +1371,8 @@ void filebrowser(const char* executables) {
             fileItems[total_files].is_directory = fileInfo.fattrib & AM_DIR;
             fileItems[total_files].size = fileInfo.fsize;
             fileItems[total_files].is_executable = !(fileInfo.fattrib & AM_DIR) &&
-                                                   rom_fits(fileInfo.fsize) &&
-                                                   isExecutable(fileInfo.fname, executables);
+                (is_palette_text_file(fileInfo.fname) ||
+                 (rom_fits(fileInfo.fsize) && isExecutable(fileInfo.fname, executables)));
             strncpy(fileItems[total_files].filename, fileInfo.fname, 78);
             total_files++;
         }
@@ -1550,6 +1565,24 @@ void filebrowser(const char* executables) {
                     char fullpath[256];
                     const bool path_ok = snprintf(fullpath, sizeof fullpath, "%s\\%s", basepath,
                                                   file_at_cursor.filename) < (int)sizeof fullpath;
+                    if (path_ok && is_palette_text_file(file_at_cursor.filename)) {
+                        const int w = TEXTMODE_COLS < 38 ? TEXTMODE_COLS : 38;
+                        const int x = (TEXTMODE_COLS - w) / 2;
+                        const int y = (TEXTMODE_ROWS - 5) / 2;
+                        draw_window("Import palette", x, y, w, 5);
+                        draw_text("Replacing current CUSTOM palettes", x + 1, y + 2, 13, 1);
+                        sleep_ms(60); // show replacement notice, no confirmation
+                        const palette_import_result_e result = import_palette_file(fullpath);
+                        const char* message = result == PAL_IMPORT_12 ? "12 CUSTOM colours replaced" :
+                            result == PAL_IMPORT_16 ? "16 shades CUSTOM replaced" :
+                            result == PAL_IMPORT_FORMAT ? "Unexpected format" : "Cannot read palette file";
+                        draw_window("Import palette", x, y, w, 5); // clear the earlier notice
+                        draw_text(message, x + 1, y + 2,
+                                  result == PAL_IMPORT_12 || result == PAL_IMPORT_16 ? 10 : 13, 1);
+                        sleep_ms(1300);
+                        strcpy(focus, file_at_cursor.filename);
+                        break; // redraw browser; never treat a palette as a ROM
+                    }
                     if (path_ok && gbbp_try_install(fullpath)) {
                         // its message covered the list: redraw it, same entry
                         strcpy(focus, file_at_cursor.filename);
@@ -2191,9 +2224,10 @@ static void palette_apply() {
  * The standard palette_apply() remains intact for all existing presets.
  */
 static void palette16_apply() {
-    if (gb.cgb.cgbMode || palette16_select == 0 || palette16_select > GB_PALETTES16_COUNT)
+    if (gb.cgb.cgbMode || palette16_select == 0 || palette16_select > PALETTE16_CUSTOM)
         return;
-    const uint32_t* const rgb = gb_palettes16[palette16_select - 1];
+    const uint32_t* const rgb = palette16_select == PALETTE16_CUSTOM ?
+        custom_shades16 : gb_palettes16[palette16_select - 1];
     for (unsigned layer = 0; layer < LAYER_COUNT; layer++)
         for (unsigned shade = 0; shade < 4; shade++) {
             const uint32_t c = rgb[shade * 4 + shade];
@@ -2393,7 +2427,7 @@ static bool load_game_palette_ini() {
     palette_all = sel_all <= PALETTE_CUSTOM ? (uint8_t)sel_all : PALETTE_CUSTOM;
     const char* p16 = layers ? strstr(layers + 1, "palette16=") : nullptr;
     const unsigned long sel16 = p16 ? strtoul(p16 + sizeof("palette16=") - 1, nullptr, 10) : 0;
-    palette16_select = sel16 <= GB_PALETTES16_COUNT ? (uint8_t)sel16 : 0;
+    palette16_select = sel16 <= PALETTE16_CUSTOM ? (uint8_t)sel16 : 0;
     randomize_random_layers();
     update_palette();
     return true;
@@ -2907,10 +2941,10 @@ const MenuItem menu_items[] = {
             "CUSTOM           "
         }
     },
-    { "16 shades: %s", ARRAY, &palette16_select, nullptr, GB_PALETTES16_COUNT,
+    { "16 shades: %s", ARRAY, &palette16_select, nullptr, PALETTE16_CUSTOM,
       { "OFF    ", "GRAY   ", "RED    ", "ORANGE ", "GREEN  ", "BLUE   ", "PURPLE ",
         "OGBP   ", "OGBR   ", "GBPR   ", "GBPO   ", "BPRO   ", "BROG   ", "PROG   ",
-        "POGR   ", "ROGB   ", "ROGP   " } },
+        "POGR   ", "ROGB   ", "ROGP   ", "CUSTOM " } },
     { "Palette editor", PALETTE_EDITOR },
     { "", GAME_INI, nullptr, &game_ini_action },
     { "LCD ghosting: %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
@@ -2963,7 +2997,7 @@ static void f_load_conf(void) {
     char pathname[96];
     config_path(pathname, sizeof pathname);
     if (f_open(&f, pathname, FA_READ) == FR_OK) {
-        static char text[512];
+        static char text[768];
         UINT br = 0;
         if (f_read(&f, text, sizeof text - 1, &br) != FR_OK) br = 0;
         f_close(&f);
@@ -2987,7 +3021,24 @@ static void f_load_conf(void) {
 #endif
             else if (!strcmp(line, "palette_all")) palette_all = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
             else if (!strcmp(line, "palette16"))
-                palette16_global = palette16_select = d <= GB_PALETTES16_COUNT ? (uint8_t)d : 0;
+                palette16_global = palette16_select = d <= PALETTE16_CUSTOM ? (uint8_t)d : 0;
+            else if (!strcmp(line, "custom16")) {
+                uint32_t rgb[16];
+                const char* p = val;
+                bool valid = true;
+                for (unsigned i = 0; i < 16; i++) {
+                    char* end;
+                    const unsigned long c = strtoul(p, &end, 16);
+                    if (end - p != 6 || c > 0xFFFFFFul ||
+                        (i < 15 ? *end != ',' : *end != '\0')) {
+                        valid = false;
+                        break;
+                    }
+                    rgb[i] = (uint32_t)c;
+                    p = end + 1;
+                }
+                if (valid) memcpy(custom_shades16, rgb, sizeof rgb);
+            }
             else if (!strcmp(line, "screen")) screen_scale = d <= GRAPHICS_SCALE_STRETCH ? (uint8_t)d : screen_scale;
             else if (!strncmp(line, "palette", 7) || !strncmp(line, "custom", 6)) {
                 const bool custom = line[0] == 'c';
@@ -3020,7 +3071,7 @@ static void f_save_conf(void) {
     char pathname[96];
     config_mkdirs();
     config_path(pathname, sizeof pathname);
-    static char text[512];
+    static char text[768];
     palette16_global = palette16_select;
     int len = snprintf(text, sizeof text, "swap_ab=%u\r\ntv_system=%u\r\nscreen=%u\r\npalette_all=%u\r\nlcd_ghosting=%u\r\ndemo_duration=%u\r\ndemo_name=%u\r\ndemo_timer_osd=%u\r\n",
                        (unsigned)swap_ab, (unsigned)tv_system, (unsigned)screen_scale, (unsigned)palette_all,
@@ -3032,7 +3083,12 @@ static void f_save_conf(void) {
                         (unsigned long)custom_rgb[i][0], (unsigned long)custom_rgb[i][1],
                         (unsigned long)custom_rgb[i][2], (unsigned long)custom_rgb[i][3]);
     if (len > 0 && len < (int)sizeof text)
-        len += snprintf(text + len, sizeof text - len, "palette16=%u\r\n", (unsigned)palette16_global);
+        len += snprintf(text + len, sizeof text - len, "palette16=%u\r\ncustom16=", (unsigned)palette16_global);
+    for (unsigned i = 0; i < 16 && len > 0 && len < (int)sizeof text; i++)
+        len += snprintf(text + len, sizeof text - len, "%s%06lX",
+                        i ? "," : "", (unsigned long)custom_shades16[i]);
+    if (len > 0 && len < (int)sizeof text)
+        len += snprintf(text + len, sizeof text - len, "\r\n");
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\n",
                         (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level);
@@ -3046,6 +3102,62 @@ static void f_save_conf(void) {
     UINT bw;
     f_write(&f, text, (UINT)len, &bw);
     f_close(&f);
+}
+
+/* Palette import: six-hex-digit RGB tokens separated by arbitrary non-hex
+ * characters. Runs of other lengths (including words) are ignored, not split.
+ * Read at most sixteen colours; the only valid totals are 12 and 16. */
+static palette_import_result_e import_palette_file(const char* pathname) {
+    static FIL file;         // core 0 has a small stack
+    static char chunk[256];
+    if (f_open(&file, pathname, FA_READ) != FR_OK) return PAL_IMPORT_IO;
+
+    uint32_t colours[16];
+    unsigned found = 0;
+    unsigned digits = 0;
+    uint32_t value = 0;
+    FRESULT fr = FR_OK;
+    UINT nr = 0;
+    bool eof = false;
+    while (found < 16 && !eof) {
+        fr = f_read(&file, chunk, sizeof chunk, &nr);
+        if (fr != FR_OK || nr == 0) {
+            eof = true;
+            break;
+        }
+        for (UINT i = 0; i < nr && found < 16; i++) {
+            const unsigned char c = (unsigned char)chunk[i];
+            const int hex = c >= '0' && c <= '9' ? c - '0' :
+                            c >= 'A' && c <= 'F' ? c - 'A' + 10 :
+                            c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+            if (hex >= 0) {
+                if (digits < 6) value = (value << 4) | (unsigned)hex;
+                if (digits < 7) digits++; // >6 hex digits is not an RGB token
+            } else {
+                if (digits == 6) colours[found++] = value;
+                digits = 0;
+                value = 0;
+            }
+        }
+    }
+    const FRESULT close_fr = f_close(&file);
+    if (fr != FR_OK || close_fr != FR_OK) return PAL_IMPORT_IO;
+    if (eof && digits == 6 && found < 16) colours[found++] = value;
+    if (found != 12 && found != 16) return PAL_IMPORT_FORMAT;
+
+    if (found == 12) {
+        memcpy(custom_rgb, colours, sizeof custom_rgb);
+        palette16_select = 0; // 12 colours: normal 3x4 palettes
+    } else {
+        memcpy(custom_shades16, colours, sizeof custom_shades16);
+        palette16_select = PALETTE16_CUSTOM; // 16 colours: 4x4 shade transitions
+    }
+    palette_all = PALETTE_CUSTOM;
+    for (unsigned layer = 0; layer < LAYER_COUNT; layer++)
+        palette_index[layer] = PALETTE_CUSTOM;
+    if (gb_initialized && !gb.cgb.cgbMode) update_palette();
+    f_save_conf();
+    return found == 12 ? PAL_IMPORT_12 : PAL_IMPORT_16;
 }
 
 static void menu_frame() {

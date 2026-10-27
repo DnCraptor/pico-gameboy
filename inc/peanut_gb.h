@@ -3652,6 +3652,16 @@ void __gb_step_cpu(struct gb_s *gb)
 
 	do
 	{
+#if ENABLE_SOUND && !HWAY
+		/* Advance the audio clock once per emulated CPU timeslice.
+		 * Only APU register writes actually trigger audio rendering. */
+#if PEANUT_FULL_GBC_SUPPORT
+		gb_audio_cycles += inst_cycles > 1 ?
+			(inst_cycles >> gb->cgb.doubleSpeed) : inst_cycles;
+#else
+		gb_audio_cycles += inst_cycles;
+#endif
+#endif
 		/* DIV register timing */
 		gb->counter.div_count += inst_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)

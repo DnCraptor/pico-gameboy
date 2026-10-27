@@ -183,7 +183,7 @@ static void update_sweep(struct chan *c)
 	}
 }
 
-static void update_square(int16_t* samples, const bool ch2)
+static void update_square(int16_t* samples, const bool ch2, const uint_fast16_t sample_count)
 {
 	uint32_t freq;
 	struct chan* c = chans + ch2;
@@ -195,7 +195,7 @@ static void update_square(int16_t* samples, const bool ch2)
 	set_note_freq(c, freq);
 	c->freq_inc *= 8;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < sample_count; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -243,7 +243,7 @@ static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
 	return volume ? (sample >> (volume - 1)) : 0;
 }
 
-static void update_wave(int16_t *samples)
+static void update_wave(int16_t *samples, const uint_fast16_t sample_count)
 {
 	uint32_t freq;
 	struct chan *c = chans + 2;
@@ -256,7 +256,7 @@ static void update_wave(int16_t *samples)
 
 	c->freq_inc *= 32;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < sample_count; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -297,7 +297,7 @@ static void update_wave(int16_t *samples)
 	}
 }
 
-static void update_noise(int16_t *samples)
+static void update_noise(int16_t *samples, const uint_fast16_t sample_count)
 {
 	struct chan *c = chans + 3;
 
@@ -317,7 +317,7 @@ static void update_noise(int16_t *samples)
 	if (c->freq >= 14)
 		c->enabled = 0;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < sample_count; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -361,20 +361,53 @@ static void update_noise(int16_t *samples)
 	}
 }
 
-/**
- * SDL2 style audio callback function.
- */
+/* Render any part of an audio buffer with the APU register values which
+ * were effective at that point in *emulated CPU time*.  In particular,
+ * streaming voice via FF30..FF3F must not see only the final wave table. */
+static void audio_render_samples(int16_t *stream, const uint_fast16_t count)
+{
+	update_square(stream, 0, count);
+	update_square(stream, 1, count);
+	update_wave(stream, count);
+	update_noise(stream, count);
+}
+
+/** SDL2-style full-buffer callback, retained for HWAY and other callers. */
 void audio_callback(void *userdata, int16_t *stream, size_t len)
 {
-	/* Appease unused variable warning. */
 	(void)userdata;
-
 	memset(stream, 0, len);
+	audio_render_samples(stream, AUDIO_NSAMPLES);
+}
 
-	update_square(stream, 0);
-	update_square(stream, 1);
-	update_wave(stream);
-	update_noise(stream);
+/* Unlike a frame-end APU callback, this tracks register writes inside the
+ * emulated frame.  No allocation, events array, or additional output buffer.
+ * At most AUDIO_SAMPLES stereo frames are rendered per GB frame in total. */
+static int16_t *audio_frame_stream;
+static uint_fast16_t audio_frame_pos;
+
+static void audio_frame_sync(const uint32_t cycles)
+{
+	if (!audio_frame_stream) return;
+	const uint_fast16_t target = cycles >= 70224u ? AUDIO_SAMPLES :
+		(uint_fast16_t)((cycles * (uint32_t)AUDIO_SAMPLES) / 70224u);
+	if (target <= audio_frame_pos) return;
+	const uint_fast16_t frames = target - audio_frame_pos;
+	audio_render_samples(audio_frame_stream + audio_frame_pos * 2u, frames * 2u);
+	audio_frame_pos = target;
+}
+
+void audio_frame_begin(int16_t *stream)
+{
+	memset(stream, 0, AUDIO_BUFFER_SIZE_BYTES);
+	audio_frame_pos = 0;
+	audio_frame_stream = stream;
+}
+
+void audio_frame_end(void)
+{
+	audio_frame_sync(70224u);
+	audio_frame_stream = NULL;
 }
 
 #ifdef HWAY
@@ -541,6 +574,9 @@ uint8_t audio_read(const uint16_t addr)
  */
 void audio_write(const uint16_t addr, const uint8_t val)
 {
+	/* Finish samples up to this CPU write using the PREVIOUS register
+	 * values.  That preserves the succession of CH3 wave-RAM tables for PCM. */
+	audio_frame_sync(gb_audio_cycles);
 	/* Find sound channel corresponding to register address. */
 	uint_fast8_t i;
 

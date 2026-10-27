@@ -161,6 +161,11 @@ semaphore vga_start_semaphore;
 static volatile bool render_ready = false;
 
 gb_s gb;
+/* Time in base Game Boy CPU cycles since the start of the audio frame.
+ * Shared with the C APU synthesizer; no extra field in gb_s/save states. */
+extern "C" {
+uint32_t gb_audio_cycles = 0;
+}
 /* True only after a successful gb_init().  A menu entered from the ROM
  * browser must never use a non-initialised (or failed) GB context. */
 static bool gb_initialized = false;
@@ -3550,15 +3555,22 @@ int main() {
 
             //-----------------------------------------------------------------
             gb_debug_phase = 1;
+#if !HWAY
+            gb_audio_cycles = 0;
+            audio_frame_begin(reinterpret_cast<int16_t *>(stream));
+#endif
             gb_run_frame(&gb);
             gb_debug_phase = 2;
+#if !HWAY
+            audio_frame_end();
+#endif
             replay_end_frame();
 
             //gb.direct.interlace = 1;
 
             if (!gb.direct.frame_skip) {
-                audio_callback(NULL, reinterpret_cast<int16_t *>(stream), AUDIO_BUFFER_SIZE_BYTES);
 #if HWAY
+                audio_callback(NULL, reinterpret_cast<int16_t *>(stream), AUDIO_BUFFER_SIZE_BYTES);
                 audio_hway_update();
                 hway_frame_wait();
 #else

@@ -27,6 +27,11 @@ extern "C" {
  */
 void audio_callback(void *ptr, int16_t *data, size_t len);
 
+/* Synthesis synced to emulated CPU register writes (PCM / wave RAM). */
+extern uint32_t gb_audio_cycles;
+void audio_frame_begin(int16_t *data);
+void audio_frame_end(void);
+
 /**
  * Read audio register at given address "addr".
  */

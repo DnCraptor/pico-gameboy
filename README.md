@@ -120,11 +120,18 @@ Selecting a `.gbbp` file installs it as the backplane (see below).
 A Game Boy game has three 4-shade palettes: the background (BG) and two
 sprite palettes (OBJ0, OBJ1). **Palette** sets all three: AUTO (the colours
 a Game Boy Color gives this game), the Game Boy Color boot palettes, the
+Super Game Boy palettes of
+[lospec.com](https://lospec.com/palette-list/nintendo-super-gameboy), the
 pico-gamate 4-colour palettes, RANDOM or CUSTOM; with CUSTOM each palette
 has its own selector. The **palette editor** (F12) shows all 12 colours:
 arrows choose a colour, Enter / A edits it (left / right — R, G, B, up /
 down — the value, or type `RRGGBB`), Esc / B goes back, START / F12 closes
 the editor. Editing a colour turns its palette into CUSTOM.
+
+A palette file (`.txt`, `.csv` or `.hex`) selected in the ROM browser
+replaces the CUSTOM colours: the `RRGGBB` values in it are read in order,
+4 of them (a lospec.com `.hex` file) go to all three palettes, 12 — BG,
+OBJ0, OBJ1, 16 — the CUSTOM 16-shade preset.
 
 F7 and F8 save the colours of a game as `/.config/gbc/<ROM file>.ini`; the
 preset is applied whenever that cartridge is started.
@@ -223,7 +230,10 @@ read once if there is no `config.ini`.
 closed): `swap_ab`, `tv_system`, `tv_color`, `screen`, `palette_all`,
 `palette0..2`, `custom0..2` (`RRGGBB,RRGGBB,RRGGBB,RRGGBB`), `palette16`,
 `lcd_ghosting`, `demo_duration`, `demo_name`, `demo_timer_osd`,
-`backplane`, `gray_lines`, `gray_level`. Unknown keys are ignored.
+`backplane`, `gray_lines`, `gray_level`, `palette_list` (the numbering of
+the palettes: without `palette_list=2` the numbers after DMG are those
+from before the Super Game Boy palettes and are moved up by 30). Unknown
+keys are ignored.
 
 ## Building
 

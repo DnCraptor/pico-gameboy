@@ -1,4 +1,6 @@
 # Unreleased
+- 30 Super Game Boy palettes from lospec.com after DMG; the palette numbers in config.ini and the game .ini files of older versions are moved up
+- palette file import: .hex files too, 4 colours go to all three CUSTOM palettes
 - gray lines between the pixels (the LCD grid), 2x and 3x: VGA - vertical, horizontal or both, HDMI - horizontal; Gray level 0..3
 - TV-SOFT: Colors YES / NO (a black and white picture without the colour subcarrier)
 - build-all.sh / build-all-rp2350.bat: every supported RP2350 configuration; the HDMI / I2S defaults of CMakeLists.txt can be overridden on the command line

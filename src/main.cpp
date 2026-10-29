@@ -201,6 +201,13 @@ static constexpr uint8_t PALETTE_AUTO = 0;                               // by t
 static constexpr uint8_t PALETTE_MONO_FIRST = NUMBER_OF_MANUAL_PALETTES; // pico-gamate 4-colour palettes
 static constexpr uint8_t PALETTE_RANDOM = PALETTE_MONO_FIRST + MONO_PALETTES_NUMBER;
 static constexpr uint8_t PALETTE_CUSTOM = PALETTE_RANDOM + 1;
+/* The palette numbers in config.ini and the game .ini files.  List 2 put the
+ * Super Game Boy palettes after DMG: a file without "palette_list=2" numbers
+ * every palette after DMG SGB_PALETTES_NUMBER lower. */
+static constexpr unsigned PALETTE_LIST_VERSION = 2;
+static uint8_t palette_from_list1(const uint8_t sel) {
+    return sel >= PALETTE_MONO_FIRST ? (uint8_t)(sel + SGB_PALETTES_NUMBER) : sel;
+}
 /* the selector for all three palettes; with CUSTOM each has its own one */
 static uint8_t palette_all = PALETTE_AUTO;
 static uint8_t palette_index[LAYER_COUNT] = { PALETTE_AUTO, PALETTE_AUTO, PALETTE_AUTO };
@@ -1283,11 +1290,11 @@ static bool demo_begin() {
  * previous one (SELECT). */
 static bool gbbp_try_install(const char* pathname); // a .gbbp file: install it as the backplane
 
-enum palette_import_result_e { PAL_IMPORT_12, PAL_IMPORT_16, PAL_IMPORT_FORMAT, PAL_IMPORT_IO };
+enum palette_import_result_e { PAL_IMPORT_4, PAL_IMPORT_12, PAL_IMPORT_16, PAL_IMPORT_FORMAT, PAL_IMPORT_IO };
 static palette_import_result_e import_palette_file(const char* pathname);
 static bool is_palette_text_file(const char* name) {
     const char* dot = strrchr(name, '.');
-    return dot && (!strcasecmp(dot, ".txt") || !strcasecmp(dot, ".csv"));
+    return dot && (!strcasecmp(dot, ".txt") || !strcasecmp(dot, ".csv") || !strcasecmp(dot, ".hex"));
 }
 
 void filebrowser(const char* executables) {
@@ -1573,12 +1580,13 @@ void filebrowser(const char* executables) {
                         draw_text("Replacing current CUSTOM palettes", x + 1, y + 2, 13, 1);
                         sleep_ms(60); // show replacement notice, no confirmation
                         const palette_import_result_e result = import_palette_file(fullpath);
-                        const char* message = result == PAL_IMPORT_12 ? "12 CUSTOM colours replaced" :
+                        const char* message = result == PAL_IMPORT_4 ? "4 colours x 3 CUSTOM replaced" :
+                            result == PAL_IMPORT_12 ? "12 CUSTOM colours replaced" :
                             result == PAL_IMPORT_16 ? "16 shades CUSTOM replaced" :
                             result == PAL_IMPORT_FORMAT ? "Unexpected format" : "Cannot read palette file";
                         draw_window("Import palette", x, y, w, 5); // clear the earlier notice
                         draw_text(message, x + 1, y + 2,
-                                  result == PAL_IMPORT_12 || result == PAL_IMPORT_16 ? 10 : 13, 1);
+                                  result == PAL_IMPORT_4 || result == PAL_IMPORT_12 || result == PAL_IMPORT_16 ? 10 : 13, 1);
                         sleep_ms(1300);
                         strcpy(focus, file_at_cursor.filename);
                         break; // redraw browser; never treat a palette as a ROM
@@ -1664,7 +1672,7 @@ typedef struct __attribute__((__packed__)) {
     const void* value;
     menu_callback_t callback;
     uint8_t max_value;
-    char value_list[49][18];
+    char value_list[PALETTE_CUSTOM + 1][18];
 } MenuItem;
 
 static int save_slot = 0;
@@ -2373,7 +2381,8 @@ static bool write_game_palette_ini() {
         len += snprintf(data + len, sizeof data - len, "%s%u\r\n", ini_layer_keys[i], sel);
     }
     if (len > 0 && len < (int)sizeof data)
-        len += snprintf(data + len, sizeof data - len, "palette16=%u\r\n", (unsigned)palette16_select);
+        len += snprintf(data + len, sizeof data - len, "palette16=%u\r\npalette_list=%u\r\n",
+                        (unsigned)palette16_select, PALETTE_LIST_VERSION);
     if (len <= 0 || len >= (int)sizeof data) return false;
 
     static FIL file; // static: core 0 has a small stack
@@ -2425,6 +2434,10 @@ static bool load_game_palette_ini() {
     const char* all = layers ? strstr(layers + 1, "all=") : nullptr;
     const unsigned long sel_all = all ? strtoul(all + 4, nullptr, 10) : PALETTE_CUSTOM;
     palette_all = sel_all <= PALETTE_CUSTOM ? (uint8_t)sel_all : PALETTE_CUSTOM;
+    if (!(layers && strstr(layers + 1, "palette_list="))) { // the numbers of list 1
+        palette_all = palette_from_list1(palette_all);
+        for (unsigned i = 0; i < LAYER_COUNT; i++) palette_index[i] = palette_from_list1(palette_index[i]);
+    }
     const char* p16 = layers ? strstr(layers + 1, "palette16=") : nullptr;
     const unsigned long sel16 = p16 ? strtoul(p16 + sizeof("palette16=") - 1, nullptr, 10) : 0;
     palette16_select = sel16 <= PALETTE16_CUSTOM ? (uint8_t)sel16 : 0;
@@ -2725,221 +2738,103 @@ static bool handle_palette_hotkeys() {
     return false;
 }
 
+/* the names of the palette selectors, in the PALETTE_* order */
+#define PALETTE_NAMES \
+    "AUTO (by game)   ", \
+    "YELLOW-RED       ", \
+    "ORANGE           ", \
+    "NEGATIVE         ", \
+    "DARK GREEN       ", \
+    "RED              ", \
+    "PINK             ", \
+    "GREEN            ", \
+    "DARK BLUE        ", \
+    "PASTEL           ", \
+    "BLUE             ", \
+    "YELLOW           ", \
+    "DMG              ", \
+    "AMERICANA        ", \
+    "AUTUMN CHILL     ", \
+    "B4SEMENT         ", \
+    "BALDUR NEON DARK ", \
+    "BICYCLE          ", \
+    "CARAMEL AUTUMN   ", \
+    "CHERRYMELON      ", \
+    "CORAL 4          ", \
+    "COSMIC CREAM GB  ", \
+    "DREAM CANDY      ", \
+    "DUSTBYTE         ", \
+    "DYING CONTRAST   ", \
+    "FORGOTTEN SWAMP  ", \
+    "FUZZYFOUR        ", \
+    "H3RRY FZ         ", \
+    "ITALY 4          ", \
+    "LASER LAB        ", \
+    "MANGAVANIA       ", \
+    "PONG4            ", \
+    "PURPLEDAWN       ", \
+    "RED POSTER       ", \
+    "RETRO VIBES      ", \
+    "RETTIEPUNK       ", \
+    "RISING SUN GB    ", \
+    "SLURRY GB        ", \
+    "SODA CAP         ", \
+    "SOFTSERVE 4      ", \
+    "STAR POP         ", \
+    "T LOLLIPOP       ", \
+    "VOLTAGE WARNING  ", \
+    "GAMATE DEFAULT   ", \
+    "BLACK & WHITE    ", \
+    "BGB              ", \
+    "AUTUMN FOREST    ", \
+    "OCEAN SAND       ", \
+    "MINT SAND        ", \
+    "AMBER            ", \
+    "GREEN            ", \
+    "BLUE             ", \
+    "WATAROO          ", \
+    "GB_DMG           ", \
+    "GB_POCKET        ", \
+    "GB_LIGHT         ", \
+    "BLOSSOM_PINK     ", \
+    "BUBBLES_BLUE     ", \
+    "BUTTERCUP_GREEN  ", \
+    "DIGIVICE         ", \
+    "GAME_COM         ", \
+    "GAMEKING         ", \
+    "GAME_MASTER      ", \
+    "GOLDEN_WILD      ", \
+    "GREENSCALE       ", \
+    "HOKAGE_ORANGE    ", \
+    "LABO_FAWN        ", \
+    "SUPER_SAIYAN     ", \
+    "MICROVISION      ", \
+    "MILLION_LIVE_GOLD", \
+    "ODYSSEY_GOLD     ", \
+    "SHINY_SKY_BLUE   ", \
+    "SLIME_BLUE       ", \
+    "TI_83            ", \
+    "TRAVEL_WOOD      ", \
+    "VIRTUAL_BOY      ", \
+    "TV-LINK          ", \
+    "RANDOM           ", \
+    "CUSTOM           "
+
 const MenuItem menu_items[] = {
     //{ "Player 1: %s",        ARRAY, &player_1_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
     //{ "Player 2: %s",        ARRAY, &player_2_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
     { "Swap AB <> BA: %s", ARRAY, &swap_ab,  nullptr, 1, {"NO ", "YES"}},
     { "Palette:      %s", ARRAY, &palette_all, nullptr, PALETTE_CUSTOM,
-        {
-            "AUTO (by game)   ",
-            "YELLOW-RED       ",
-            "ORANGE           ",
-            "NEGATIVE         ",
-            "DARK GREEN       ",
-            "RED              ",
-            "PINK             ",
-            "GREEN            ",
-            "DARK BLUE        ",
-            "PASTEL           ",
-            "BLUE             ",
-            "YELLOW           ",
-            "DMG              ",
-            "GAMATE DEFAULT   ",
-            "BLACK & WHITE    ",
-            "BGB              ",
-            "AUTUMN FOREST    ",
-            "OCEAN SAND       ",
-            "MINT SAND        ",
-            "AMBER            ",
-            "GREEN            ",
-            "BLUE             ",
-            "WATAROO          ",
-            "GB_DMG           ",
-            "GB_POCKET        ",
-            "GB_LIGHT         ",
-            "BLOSSOM_PINK     ",
-            "BUBBLES_BLUE     ",
-            "BUTTERCUP_GREEN  ",
-            "DIGIVICE         ",
-            "GAME_COM         ",
-            "GAMEKING         ",
-            "GAME_MASTER      ",
-            "GOLDEN_WILD      ",
-            "GREENSCALE       ",
-            "HOKAGE_ORANGE    ",
-            "LABO_FAWN        ",
-            "SUPER_SAIYAN     ",
-            "MICROVISION      ",
-            "MILLION_LIVE_GOLD",
-            "ODYSSEY_GOLD     ",
-            "SHINY_SKY_BLUE   ",
-            "SLIME_BLUE       ",
-            "TI_83            ",
-            "TRAVEL_WOOD      ",
-            "VIRTUAL_BOY      ",
-            "TV-LINK          ",
-            "RANDOM           ",
-            "CUSTOM           "
-        }
+        { PALETTE_NAMES }
     },
     { "  BG:         %s", ARRAY, &palette_index[LAYER_BG], nullptr, PALETTE_CUSTOM,
-        {
-            "AUTO (by game)   ",
-            "YELLOW-RED       ",
-            "ORANGE           ",
-            "NEGATIVE         ",
-            "DARK GREEN       ",
-            "RED              ",
-            "PINK             ",
-            "GREEN            ",
-            "DARK BLUE        ",
-            "PASTEL           ",
-            "BLUE             ",
-            "YELLOW           ",
-            "DMG              ",
-            "GAMATE DEFAULT   ",
-            "BLACK & WHITE    ",
-            "BGB              ",
-            "AUTUMN FOREST    ",
-            "OCEAN SAND       ",
-            "MINT SAND        ",
-            "AMBER            ",
-            "GREEN            ",
-            "BLUE             ",
-            "WATAROO          ",
-            "GB_DMG           ",
-            "GB_POCKET        ",
-            "GB_LIGHT         ",
-            "BLOSSOM_PINK     ",
-            "BUBBLES_BLUE     ",
-            "BUTTERCUP_GREEN  ",
-            "DIGIVICE         ",
-            "GAME_COM         ",
-            "GAMEKING         ",
-            "GAME_MASTER      ",
-            "GOLDEN_WILD      ",
-            "GREENSCALE       ",
-            "HOKAGE_ORANGE    ",
-            "LABO_FAWN        ",
-            "SUPER_SAIYAN     ",
-            "MICROVISION      ",
-            "MILLION_LIVE_GOLD",
-            "ODYSSEY_GOLD     ",
-            "SHINY_SKY_BLUE   ",
-            "SLIME_BLUE       ",
-            "TI_83            ",
-            "TRAVEL_WOOD      ",
-            "VIRTUAL_BOY      ",
-            "TV-LINK          ",
-            "RANDOM           ",
-            "CUSTOM           "
-        }
+        { PALETTE_NAMES }
     },
     { "  OBJ0:       %s", ARRAY, &palette_index[LAYER_OBJ0], nullptr, PALETTE_CUSTOM,
-        {
-            "AUTO (by game)   ",
-            "YELLOW-RED       ",
-            "ORANGE           ",
-            "NEGATIVE         ",
-            "DARK GREEN       ",
-            "RED              ",
-            "PINK             ",
-            "GREEN            ",
-            "DARK BLUE        ",
-            "PASTEL           ",
-            "BLUE             ",
-            "YELLOW           ",
-            "DMG              ",
-            "GAMATE DEFAULT   ",
-            "BLACK & WHITE    ",
-            "BGB              ",
-            "AUTUMN FOREST    ",
-            "OCEAN SAND       ",
-            "MINT SAND        ",
-            "AMBER            ",
-            "GREEN            ",
-            "BLUE             ",
-            "WATAROO          ",
-            "GB_DMG           ",
-            "GB_POCKET        ",
-            "GB_LIGHT         ",
-            "BLOSSOM_PINK     ",
-            "BUBBLES_BLUE     ",
-            "BUTTERCUP_GREEN  ",
-            "DIGIVICE         ",
-            "GAME_COM         ",
-            "GAMEKING         ",
-            "GAME_MASTER      ",
-            "GOLDEN_WILD      ",
-            "GREENSCALE       ",
-            "HOKAGE_ORANGE    ",
-            "LABO_FAWN        ",
-            "SUPER_SAIYAN     ",
-            "MICROVISION      ",
-            "MILLION_LIVE_GOLD",
-            "ODYSSEY_GOLD     ",
-            "SHINY_SKY_BLUE   ",
-            "SLIME_BLUE       ",
-            "TI_83            ",
-            "TRAVEL_WOOD      ",
-            "VIRTUAL_BOY      ",
-            "TV-LINK          ",
-            "RANDOM           ",
-            "CUSTOM           "
-        }
+        { PALETTE_NAMES }
     },
     { "  OBJ1:       %s", ARRAY, &palette_index[LAYER_OBJ1], nullptr, PALETTE_CUSTOM,
-        {
-            "AUTO (by game)   ",
-            "YELLOW-RED       ",
-            "ORANGE           ",
-            "NEGATIVE         ",
-            "DARK GREEN       ",
-            "RED              ",
-            "PINK             ",
-            "GREEN            ",
-            "DARK BLUE        ",
-            "PASTEL           ",
-            "BLUE             ",
-            "YELLOW           ",
-            "DMG              ",
-            "GAMATE DEFAULT   ",
-            "BLACK & WHITE    ",
-            "BGB              ",
-            "AUTUMN FOREST    ",
-            "OCEAN SAND       ",
-            "MINT SAND        ",
-            "AMBER            ",
-            "GREEN            ",
-            "BLUE             ",
-            "WATAROO          ",
-            "GB_DMG           ",
-            "GB_POCKET        ",
-            "GB_LIGHT         ",
-            "BLOSSOM_PINK     ",
-            "BUBBLES_BLUE     ",
-            "BUTTERCUP_GREEN  ",
-            "DIGIVICE         ",
-            "GAME_COM         ",
-            "GAMEKING         ",
-            "GAME_MASTER      ",
-            "GOLDEN_WILD      ",
-            "GREENSCALE       ",
-            "HOKAGE_ORANGE    ",
-            "LABO_FAWN        ",
-            "SUPER_SAIYAN     ",
-            "MICROVISION      ",
-            "MILLION_LIVE_GOLD",
-            "ODYSSEY_GOLD     ",
-            "SHINY_SKY_BLUE   ",
-            "SLIME_BLUE       ",
-            "TI_83            ",
-            "TRAVEL_WOOD      ",
-            "VIRTUAL_BOY      ",
-            "TV-LINK          ",
-            "RANDOM           ",
-            "CUSTOM           "
-        }
+        { PALETTE_NAMES }
     },
     { "16 shades: %s", ARRAY, &palette16_select, nullptr, PALETTE16_CUSTOM,
       { "OFF    ", "GRAY   ", "RED    ", "ORANGE ", "GREEN  ", "BLUE   ", "PURPLE ",
@@ -3002,6 +2897,7 @@ static void f_load_conf(void) {
         if (f_read(&f, text, sizeof text - 1, &br) != FR_OK) br = 0;
         f_close(&f);
         text[br] = '\0';
+        unsigned long palette_list = 1;
         for (char* line = strtok(text, "\r\n"); line; line = strtok(nullptr, "\r\n")) {
             char* val = strchr(line, '=');
             if (!val) continue;
@@ -3020,6 +2916,7 @@ static void f_load_conf(void) {
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
 #endif
             else if (!strcmp(line, "palette_all")) palette_all = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
+            else if (!strcmp(line, "palette_list")) palette_list = d;
             else if (!strcmp(line, "palette16"))
                 palette16_global = palette16_select = d <= PALETTE16_CUSTOM ? (uint8_t)d : 0;
             else if (!strcmp(line, "custom16")) {
@@ -3047,6 +2944,11 @@ static void f_load_conf(void) {
                 if (custom) parse_rgb4(val, custom_rgb[layer]);
                 else palette_index[layer] = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
             }
+        }
+        if (palette_list < PALETTE_LIST_VERSION) {
+            palette_all = palette_from_list1(palette_all);
+            for (unsigned layer = 0; layer < LAYER_COUNT; layer++)
+                palette_index[layer] = palette_from_list1(palette_index[layer]);
         }
     }
     else if (f_open(&f, "/GB/gb.conf", FA_READ) == FR_OK) {
@@ -3090,8 +2992,8 @@ static void f_save_conf(void) {
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "\r\n");
     if (len > 0 && len < (int)sizeof text)
-        len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\n",
-                        (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level);
+        len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\npalette_list=%u\r\n",
+                        (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level, PALETTE_LIST_VERSION);
 #if BACKPLANE
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "backplane=%u\r\n", (unsigned)backplane);
@@ -3106,7 +3008,8 @@ static void f_save_conf(void) {
 
 /* Palette import: six-hex-digit RGB tokens separated by arbitrary non-hex
  * characters. Runs of other lengths (including words) are ignored, not split.
- * Read at most sixteen colours; the only valid totals are 12 and 16. */
+ * Read at most sixteen colours; the only valid totals are 4, 12 and 16.
+ * 4 colours (a .hex file of lospec.com) go to all three palettes. */
 static palette_import_result_e import_palette_file(const char* pathname) {
     static FIL file;         // core 0 has a small stack
     static char chunk[256];
@@ -3143,9 +3046,11 @@ static palette_import_result_e import_palette_file(const char* pathname) {
     const FRESULT close_fr = f_close(&file);
     if (fr != FR_OK || close_fr != FR_OK) return PAL_IMPORT_IO;
     if (eof && digits == 6 && found < 16) colours[found++] = value;
-    if (found != 12 && found != 16) return PAL_IMPORT_FORMAT;
+    if (found != 4 && found != 12 && found != 16) return PAL_IMPORT_FORMAT;
+    if (found == 4)
+        for (unsigned i = 4; i < 12; i++) colours[i] = colours[i & 3];
 
-    if (found == 12) {
+    if (found == 4 || found == 12) {
         memcpy(custom_rgb, colours, sizeof custom_rgb);
         palette16_select = 0; // 12 colours: normal 3x4 palettes
     } else {
@@ -3157,7 +3062,7 @@ static palette_import_result_e import_palette_file(const char* pathname) {
         palette_index[layer] = PALETTE_CUSTOM;
     if (gb_initialized && !gb.cgb.cgbMode) update_palette();
     f_save_conf();
-    return found == 12 ? PAL_IMPORT_12 : PAL_IMPORT_16;
+    return found == 4 ? PAL_IMPORT_4 : found == 12 ? PAL_IMPORT_12 : PAL_IMPORT_16;
 }
 
 static void menu_frame() {

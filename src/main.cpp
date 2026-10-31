@@ -3352,8 +3352,16 @@ int main() {
         } else if (demo_active && demo_advance_pending) {
             demo_advance_pending = false;
             demo_loaded = demo_load_next_rom(demo_current_name);
-            if (!demo_loaded) demo_loaded = demo_load_next_rom(nullptr); // wrap
-            if (!demo_loaded) demo_active = false;
+            if (!demo_loaded) {
+                // The last playable ROM of the directory has been shown:
+                // finish the Demo and fall through to the file browser
+                // (no wrap-around to the first ROM).
+                demo_active = false;
+                // Put the browser cursor on the ROM the Demo ended with,
+                // if it is in the directory the browser is showing.
+                if (demo_current_name[0] && strcmp(demo_dir, fb_dir) == 0)
+                    snprintf(fb_focus, sizeof fb_focus, "%s", demo_current_name);
+            }
         }
         if (FR_OK == fr && !browser_rom_preloaded && !demo_loaded) {
             fb_rom_ready = false; // a previous browser selection is not a new launch

@@ -3281,6 +3281,25 @@ static void hway_frame_wait() {
 }
 #endif
 
+/* A new game must not inherit anything the display still holds from the old
+ * one: the last frame (front or still pending), the LCD ghosting history, the
+ * Game Boy Color palette sets of a frame.  Without this the old picture stays
+ * on the screen while the new ROM is loaded, and the colours of the new game
+ * (a DMG palette goes to the video driver at once) are applied to it. */
+static void game_video_reset() {
+    critical_section_enter_blocking(&frame_lock);
+    frame_pending = -1;     // an unshown frame of the old game is dropped
+    frame_started = false;
+    critical_section_exit(&frame_lock);
+    memset(SCREEN, 0, sizeof SCREEN);
+    memset(SCREEN_2, 0, sizeof SCREEN_2);
+    memset(frame_sets, 0, sizeof frame_sets);
+    memset(blend_prev, 0, sizeof blend_prev);
+    // colour 0 is black until the new game's palette is in place
+    graphics_set_palette(0, RGB888(0, 0, 0));
+    graphics_set_buffer((uint8_t *)frames[frame_front], LCD_WIDTH, LCD_HEIGHT);
+}
+
 int main() {
     detect_flash_size();
     overclock();
@@ -3391,6 +3410,7 @@ int main() {
         }
         if (!cartridge_selected) continue;
 
+        game_video_reset(); // nothing of the previous game on the screen
         graphics_set_mode(GRAPHICSMODE_DEFAULT);
         /* Initialise GB context. */
         cgb_palette_reset();

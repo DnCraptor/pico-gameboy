@@ -51,7 +51,12 @@
 
 /* Project headers */
 #include "hedley.h"
+#include "game_genie.h"
+static GameGenie game_genie;
+#define PEANUT_GB_ROM_READ(gb, address, offset) \
+    game_genie.patch((address), (gb)->gb_rom_read((gb), (offset)))
 #include "peanut_gb.h"
+#undef PEANUT_GB_ROM_READ
 #include "gbcolors.h"
 #include "mono_palettes.h"
 #include "gb_palettes16.h"
@@ -227,6 +232,9 @@ static uint32_t custom_shades16[16] = {
     0x303030, 0x202020, 0x101010, 0x000000
 };
 static bool game_ini_linked = false;
+static char cheat_rom_path[256];
+static bool cheats_available = false;
+static GameGenie::LoadResult cheat_load_result = GameGenie::LoadResult::Missing;
 static char rom_file[80] = "";      // the ROM file name, for the game palette
 
 /* ROM demonstration: same duration choices as pico-watara.  The playback
@@ -299,8 +307,8 @@ static volatile bool kbd_page_up = false;
 static volatile bool kbd_page_down = false;
 static volatile bool kbd_home = false;
 static volatile bool kbd_end = false;
-static volatile int8_t kbd_hex_key = -1;     // a hex digit just pressed (palette editor)
-static volatile bool kbd_hex_mode = false;   // the palette editor is open: A-F, W, S are digits
+static volatile int8_t kbd_hex_key = -1;     // a hex digit just pressed in an editor
+static volatile bool kbd_hex_mode = false;   // an editor is open: A-F are hex digits
 static volatile uint8_t palette_layer_random_requested = 0;   // F1..F3: BG / OBJ0 / OBJ1
 static volatile bool palette_shuffle_requested = false;       // F7: generate + link to ROM
 static volatile bool palette_shuffle_requested_no_save = false; // F6: generate only
@@ -357,7 +365,7 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
     keyboard.left = b7 || b1 || isInReport(report, HID_KEY_ARROW_LEFT) || (wasd && isInReport(report, HID_KEY_A)) || isInReport(report, HID_KEY_KEYPAD_4);
     keyboard.right = b9 || b3 || isInReport(report, HID_KEY_ARROW_RIGHT)  || (wasd && isInReport(report, HID_KEY_D)) || isInReport(report, HID_KEY_KEYPAD_6);
 
-    // hex digits for the palette editor: 0-9 of the main block, A-F
+    // hex digits for the palette and cheat editors: 0-9 of the main block, A-F
     if (kbd_hex_mode) {
         static const uint8_t hex_keys[16] = {
             HID_KEY_0, HID_KEY_1, HID_KEY_2, HID_KEY_3, HID_KEY_4, HID_KEY_5, HID_KEY_6, HID_KEY_7,
@@ -1175,6 +1183,7 @@ bool filebrowser_loadfile(const char pathname[256]) {
         for (const char* q = pathname; *q; q++)
             if (*q == '\\' || *q == '/') name = q + 1;
         snprintf(rom_file, sizeof rom_file, "%s", name);
+        snprintf(cheat_rom_path, sizeof cheat_rom_path, "%s", pathname);
     }
     if (use_psram) {
         rom_psram_size = load_size;
@@ -1667,6 +1676,7 @@ enum menu_type_e {
     START_DEMO,
     GAME_INI,
     PALETTE_EDITOR,
+    CHEATS,
     HARD_RESET,
     RETURN,
 };
@@ -2916,6 +2926,7 @@ const MenuItem menu_items[] = {
 #endif
 },
 { "Press START / Enter to apply", NONE },
+    { "Game Genie", CHEATS },
     { "Start Demo", START_DEMO },
     { "Reset to ROM select", ROM_SELECT },
     { "Hard Reset", HARD_RESET },
@@ -3115,10 +3126,116 @@ static void menu_frame() {
     draw_text(footer, TEXTMODE_COLS / 2 - strlen(footer) / 2, TEXTMODE_ROWS - 1, 11, 1);
 }
 
+static void cheat_add_menu() {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    uint8_t digits[9] = {};
+    unsigned count = 9;
+    unsigned cursor = 0;
+    uint8_t previous = input_held();
+    const char* message = "";
+    kbd_hex_key = -1;
+    kbd_hex_mode = true;
+    draw_window("Enter Game Genie code", 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS);
+    draw_text("Arrows: edit/move  Select: length", 1, 6, 7, 0);
+    draw_text("A/Start: add  B: back  0-9/A-F: type", 1, 7, 7, 0);
+    for (;;) {
+        const uint8_t held = input_held();
+        const uint8_t pressed = held & ~previous;
+        previous = held;
+        if ((pressed & BTN_B) || filebrowser_toggle_requested) {
+            filebrowser_toggle_requested = false;
+            break;
+        }
+        if (pressed & BTN_SELECT) {
+            count = count == 9 ? 6 : 9;
+            if (cursor >= count) cursor = count - 1;
+        }
+        if (pressed & BTN_LEFT) cursor = (cursor + count - 1) % count;
+        if (pressed & BTN_RIGHT) cursor = (cursor + 1) % count;
+        if (pressed & BTN_UP) digits[cursor] = (digits[cursor] + 1) & 15;
+        if (pressed & BTN_DOWN) digits[cursor] = (digits[cursor] + 15) & 15;
+        const int digit = kbd_hex_key;
+        if (digit >= 0) {
+            kbd_hex_key = -1;
+            digits[cursor] = digit;
+            cursor = (cursor + 1) % count;
+        }
+        if (pressed || digit >= 0) message = "";
+        char code[12];
+        unsigned length = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            if (i == 3 || i == 6) code[length++] = '-';
+            code[length++] = hex[digits[i]];
+        }
+        code[length] = '\0';
+        if (pressed & (BTN_A | BTN_START)) {
+            if (game_genie.add_manual(code)) break;
+            message = "Invalid code or cheat list full";
+        }
+        char line[33];
+        snprintf(line, sizeof line, "%-32s", message);
+        draw_text(line, 1, 9, 12, 0);
+        snprintf(line, sizeof line, "%-11s", code);
+        draw_text(line, 1, 3, 7, 0);
+        char selected[] = {hex[digits[cursor]], '\0'};
+        draw_text(selected, 1 + cursor + cursor / 3, 3, 0, 15);
+        sleep_ms(25);
+    }
+    kbd_hex_mode = false;
+    kbd_hex_key = -1;
+}
+
+static void cheat_menu() {
+    unsigned cursor = 0;
+    unsigned offset = 0;
+    constexpr unsigned rows = TEXTMODE_ROWS - 3;
+    uint8_t previous = input_held();
+    draw_window("Game Genie", 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS);
+    for (;;) {
+        const uint8_t held = input_held();
+        const uint8_t pressed = held & ~previous;
+        previous = held;
+        if ((pressed & BTN_B) || filebrowser_toggle_requested) {
+            filebrowser_toggle_requested = false;
+            return;
+        }
+        if ((pressed & BTN_DOWN) && cursor < game_genie.count()) ++cursor;
+        if ((pressed & BTN_UP) && cursor) --cursor;
+        if (cursor < offset) offset = cursor;
+        if (cursor >= offset + rows) offset = cursor - rows + 1;
+        if (pressed & (BTN_A | BTN_START)) {
+            if (cursor) game_genie.toggle(cursor - 1);
+            else {
+                cheat_add_menu();
+                previous = input_held();
+                draw_window("Game Genie", 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS);
+            }
+        }
+        const char* add = "Add code...";
+        if (cheat_load_result == GameGenie::LoadResult::Error) add = "Add code... (.cht read error)";
+        if (cheat_load_result == GameGenie::LoadResult::Limited) add = "Add code... (.cht limit reached)";
+        const int width = TEXTMODE_COLS - 2;
+        char line[TEXT_BUFFER_COLS];
+        for (unsigned row = 0; row < rows; ++row) {
+            const unsigned item = offset + row;
+            if (item == 0) snprintf(line, sizeof line, "%-*.*s", width, width, add);
+            else if (item <= game_genie.count())
+                snprintf(line, sizeof line, "[%c] %-*.*s", game_genie.enabled(item - 1) ? 'X' : ' ',
+                         width - 4, width - 4, game_genie.label(item - 1));
+            else snprintf(line, sizeof line, "%-*s", width, "");
+            draw_text(line, 1, row + 1, item == cursor ? 0 : 7, item == cursor ? 15 : 0);
+        }
+        draw_text("A/Start: select  B: back", 1, TEXTMODE_ROWS - 2, 7, 0);
+        sleep_ms(25);
+    }
+}
+
+
 /* the palettes are chosen one by one only under "Palette: CUSTOM" */
 static bool menu_item_selectable(const unsigned i) {
     const MenuItem& item = menu_items[i];
     if (item.type == NONE) return false;
+    if (item.type == CHEATS) return gb_initialized && cheats_available;
     // Save states, per-game colours and the editor require a valid GB context.
     if (!gb_initialized &&
         (item.callback == &save || item.callback == &load ||
@@ -3203,6 +3320,18 @@ void menu() {
                             }
                             if (item->value == &palette16_select && (old != *value || activate) && gb_initialized)
                                 update_palette();
+                        }
+                        break;
+                    case CHEATS:
+                        if (activate && menu_item_selectable(i)) {
+                            cheat_menu();
+                            char blank[TEXT_BUFFER_COLS + 1];
+                            memset(blank, ' ', TEXTMODE_COLS);
+                            blank[TEXTMODE_COLS] = '\0';
+                            for (unsigned row = 0; row < TEXTMODE_ROWS; ++row)
+                                draw_text(blank, 0, row, 7, 0);
+                            menu_frame();
+                            prev_keys = input_held();
                         }
                         break;
                     case PALETTE_EDITOR:
@@ -3292,6 +3421,10 @@ void menu() {
                     snprintf(result, TEXTMODE_COLS, "%s",
                              game_ini_linked ? "Unlink game color file   " : "Save colors for this game");
                     if (!dmg || !rom_file[0]) color = 6;
+                    break;
+                case CHEATS:
+                    snprintf(result, TEXTMODE_COLS, "%s", item->text);
+                    if (!menu_item_selectable(i)) color = 6;
                     break;
                 case PALETTE_EDITOR:
                     snprintf(result, TEXTMODE_COLS, "%s", item->text);
@@ -3429,6 +3562,8 @@ int main() {
     while (true) {
         // A ROM switch, menu reset or Demo selection ends an old movie.
         replay_stop();
+        game_genie.clear();
+        cheats_available = false;
         // The previous game's state is no longer running.  Only a successful
         // gb_init() below permits entry into the emulator's frame loop.
         gb_initialized = false;
@@ -3505,6 +3640,8 @@ int main() {
             continue;
         }
         gb_initialized = true;
+        cheats_available = !demo_active && replay_launch == REPLAY_LAUNCH_NORMAL;
+        if (cheats_available) cheat_load_result = game_genie.load(cheat_rom_path);
         /* A new APU for every start: the channels of the previous game
          * (or of this one before a reset) must not sound in the first frames. */
         audio_init();

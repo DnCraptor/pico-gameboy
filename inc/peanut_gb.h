@@ -791,6 +791,12 @@ static struct {
 } gb_dmg_bgp;
 #endif
 
+/* Front ends may amend the mapped ROM byte using the CPU bus address.
+ * Direct ROM reads for metadata and the boot ROM bypass this hook. */
+#ifndef PEANUT_GB_ROM_READ
+#define PEANUT_GB_ROM_READ(gb, address, offset) ((gb)->gb_rom_read((gb), (offset)))
+#endif
+
 uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
@@ -807,17 +813,17 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 	case 0x1:
 	case 0x2:
 	case 0x3:
-		return gb->gb_rom_read(gb, addr);
+		return PEANUT_GB_ROM_READ(gb, addr, addr);
 
 	case 0x4:
 	case 0x5:
 	case 0x6:
 	case 0x7:
 		if(gb->mbc == 1 && gb->cart_mode_select)
-			return gb->gb_rom_read(gb,
-					       addr + ((gb->selected_rom_bank & 0x1F) - 1) * ROM_BANK_SIZE);
+			return PEANUT_GB_ROM_READ(gb, addr,
+						 addr + ((gb->selected_rom_bank & 0x1F) - 1) * ROM_BANK_SIZE);
 		else
-			return gb->gb_rom_read(gb, addr + (gb->selected_rom_bank - 1) * ROM_BANK_SIZE);
+			return PEANUT_GB_ROM_READ(gb, addr, addr + (gb->selected_rom_bank - 1) * ROM_BANK_SIZE);
 
 	case 0x8:
 	case 0x9:

@@ -113,7 +113,26 @@ Selecting a `.gbbp` file installs it as the backplane (see below).
 | Backplane | the picture around the game (2x and 3x) |
 | Gray lines, Gray level | the LCD grid (VGA, HDMI; 2x and 3x) |
 | Overclocking | the CPU clock |
+| Game Genie | toggle cheats or enter a code for the current game |
 | Start Demo, Reset to ROM select, Return to game | |
+
+## Game Genie
+
+Put a Libretro-format `.cht` beside the cartridge on the SD card and give
+both files the same basename, for example `/GB/Road Rash.gb` and
+`/GB/Road Rash.cht`. Select the ROM from SD to load its codes.
+
+In the emulator menu, choose **Game Genie**. Use Up/Down to move, A or Start
+to toggle a cheat, and B to go back. **Add code...** accepts a six- or
+nine-digit Game Genie code. Select switches length, Left/Right move the
+cursor, and Up/Down change the digit. A keyboard can also type 0–9 and A–F.
+
+The loader reads `cheatN_code`, `cheatN_desc` and `cheatN_enable`. A group
+of Game Genie codes joined by `+` toggles together. Entries with other code
+formats are skipped. Limits are 64 cheat entries and 160 individual codes.
+Changes made in the menu last for the current launch. To enable a cheat by
+default, set its `cheatN_enable` to `true` in the file. Demo and launches
+for input recording or playback run without cheats.
 
 ## Colours of Game Boy games
 

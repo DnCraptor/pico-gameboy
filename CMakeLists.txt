@@ -93,6 +93,7 @@ add_subdirectory(drivers/graphics)
 add_executable(${PROJECT_NAME}
         ext/minigb_apu/minigb_apu.c
         src/main.cpp
+        src/game_genie.cpp
         src/hid_app.cpp
         src/psram.c
 )

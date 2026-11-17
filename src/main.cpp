@@ -1667,7 +1667,7 @@ enum menu_type_e {
     START_DEMO,
     GAME_INI,
     PALETTE_EDITOR,
-    RETURN_TO_LAUNCHER,
+    HARD_RESET,
     RETURN,
 };
 
@@ -2918,7 +2918,7 @@ const MenuItem menu_items[] = {
 { "Press START / Enter to apply", NONE },
     { "Start Demo", START_DEMO },
     { "Reset to ROM select", ROM_SELECT },
-    { "Return to launcher", RETURN_TO_LAUNCHER },
+    { "Hard Reset", HARD_RESET },
     { "Return to game", RETURN }
 };
 #define MENU_ITEMS_NUMBER (sizeof(menu_items) / sizeof (MenuItem))
@@ -3140,6 +3140,9 @@ static bool menu_item_selectable(const unsigned i) {
 
 void menu() {
     bool exit = false;
+    FILINFO marker;
+    const bool return_to_launcher = f_stat("/.firmware", &marker) == FR_OK &&
+                                    !(marker.fattrib & AM_DIR);
 #if VGA || HDMI || SOFTTV
     // Keep the REC bar out of the text menu, resume it at the next game frame.
     if (replay_mode == REPLAY_RECORD) graphics_set_overlay(nullptr, false);
@@ -3217,12 +3220,12 @@ void menu() {
                             exit = true;
                         break;
 
-                    case RETURN_TO_LAUNCHER:
+                    case HARD_RESET:
                         if (activate) {
                             // START held during pico-launcher boot selects USB update mode.
                             while (input_held() & BTN_START) sleep_ms(10);
                             prev_keys = input_held();
-                            const FRESULT fr = f_unlink("/.firmware");
+                            const FRESULT fr = return_to_launcher ? f_unlink("/.firmware") : FR_OK;
                             if (fr == FR_OK || fr == FR_NO_FILE) {
                                 replay_stop();
                                 f_save_conf();
@@ -3281,6 +3284,9 @@ void menu() {
                     break;
                 case TEXT:
                     snprintf(result, TEXTMODE_COLS, item->text, item->value);
+                    break;
+                case HARD_RESET:
+                    snprintf(result, TEXTMODE_COLS, "%s", return_to_launcher ? "Return to launcher" : item->text);
                     break;
                 case GAME_INI:
                     snprintf(result, TEXTMODE_COLS, "%s",

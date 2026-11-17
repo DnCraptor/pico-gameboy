@@ -1241,9 +1241,24 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		case 0x41:
 		{
-			uint8_t lyc_line = (gb->hram_io[IO_STAT] & STAT_LYC_COINC) &&
-				(gb->hram_io[IO_STAT] & STAT_LYC_INTR);
-			gb->hram_io[IO_STAT] = (val & STAT_USER_BITS) | (gb->hram_io[IO_STAT] & STAT_MODE);
+			const uint8_t stat = gb->hram_io[IO_STAT];
+			const uint8_t mode = stat & STAT_MODE;
+			const bool lyc_line = (stat & STAT_LYC_COINC) && (stat & STAT_LYC_INTR);
+
+			/* On DMG, a STAT write briefly enables every IRQ source.
+			 * The pulse only raises an interrupt if the line was low. */
+#if PEANUT_FULL_GBC_SUPPORT
+			if(!gb->cgb.cgbMode)
+#endif
+			{
+				const bool mode_source = mode != IO_STAT_MODE_SEARCH_TRANSFER;
+				const bool mode_line = mode_source && (stat & (STAT_MODE_0_INTR << mode));
+				if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) && !lyc_line && !mode_line &&
+						(mode_source || (stat & STAT_LYC_COINC)))
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+			}
+
+			gb->hram_io[IO_STAT] = (val & STAT_USER_BITS) | mode;
 			/* enabling the LYC interrupt while LY == LYC raises it at once */
 			__gb_lyc_update(gb, lyc_line);
 			return;

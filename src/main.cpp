@@ -1297,6 +1297,7 @@ static bool demo_begin() {
 
 /* Returns when a ROM is ready to run: a newly loaded one (START) or the
  * previous one (SELECT). */
+static void f_save_conf(void);
 static bool gbbp_try_install(const char* pathname); // a .gbbp file: install it as the backplane
 
 enum palette_import_result_e { PAL_IMPORT_4, PAL_IMPORT_12, PAL_IMPORT_16, PAL_IMPORT_FORMAT, PAL_IMPORT_IO };
@@ -2096,6 +2097,9 @@ static uint8_t screen_scale = 0;
 #if (VGA || HDMI || SOFTTV) && PICO_RP2350
 #define BACKPLANE 1
 static uint8_t backplane = 1;
+// Old configs implicitly selected the installed file when it existed.
+static uint8_t backplane_skin = BACKPLANE_CUSTOM;
+static bool backplane_custom_available;
 
 /* A backplane file (.gbbp) replaces the built-in one:
  *   "GBBP", version (1 byte, GBBP_VERSION) - other versions are refused;
@@ -2103,10 +2107,11 @@ static uint8_t backplane = 1;
  *     32 colours (R, G, B bytes), the 2x cells, the 3x cells (W x 240 colour
  *     numbers 0..31 each, a row after row; the game window cells are unused).
  * A TV-SOFT build reads its part after the HDMI / VGA one.  Installed from the
- * file manager: copied to /.config/gbc/backplane.gbbp and shown from then on
- * (delete that file for the built-in one). */
+ * file manager: copied to /.config/gbc/backplane.gbbp and selected as CUSTOM. */
 #define GBBP_VERSION 1
 #define GBBP_FILE CONFIG_DIR "/backplane.gbbp"
+#define GBBP_TEMP CONFIG_DIR "/backplane.tmp"
+#define GBBP_BACKUP CONFIG_DIR "/backplane.bak"
 static constexpr uint32_t gbbp_part(const uint32_t w) { return BACKPLANE_LOADED_COLORS * 3 + 2 * w * 240; }
 static constexpr uint32_t GBBP_HEADER = 5;
 static constexpr uint32_t GBBP_SIZE = GBBP_HEADER + gbbp_part(320) + gbbp_part(384);
@@ -2116,6 +2121,16 @@ static bool gbbp_header_ok(FIL* f) {
     UINT br = 0;
     return f_size(f) == GBBP_SIZE && f_lseek(f, 0) == FR_OK && f_read(f, h, sizeof h, &br) == FR_OK &&
            br == sizeof h && !memcmp(h, "GBBP", 4) && h[4] == GBBP_VERSION;
+}
+
+static bool gbbp_custom_exists() {
+    static FIL file;
+    FRESULT result = f_open(&file, GBBP_FILE, FA_READ);
+    if (result == FR_NO_FILE && f_rename(GBBP_BACKUP, GBBP_FILE) == FR_OK)
+        result = f_open(&file, GBBP_FILE, FA_READ);
+    if (result != FR_OK) return false;
+    const bool valid = gbbp_header_ok(&file);
+    return f_close(&file) == FR_OK && valid;
 }
 
 /* the installed backplane, the part of this build, the cells of the scale */
@@ -2138,8 +2153,25 @@ static bool gbbp_load(const enum graphics_scale_t scale) {
 
 static void apply_backplane() {
     const auto scale = (enum graphics_scale_t)screen_scale;
-    if (backplane && scale != GRAPHICS_SCALE_STRETCH && gbbp_load(scale)) return;
-    graphics_set_backplane(backplane, scale);
+    if (backplane_skin == BACKPLANE_CUSTOM && backplane && scale != GRAPHICS_SCALE_STRETCH &&
+        gbbp_load(scale)) return;
+    const auto skin = backplane_skin == BACKPLANE_CUSTOM ? BACKPLANE_GREEN :
+        static_cast<backplane_skin_t>(backplane_skin);
+    graphics_set_backplane(backplane, scale, skin);
+}
+
+static bool gbbp_commit_install() {
+    // Preserve the previous custom skin until the staged file takes its place.
+    const FRESULT removed = f_unlink(GBBP_BACKUP);
+    if (removed != FR_OK && removed != FR_NO_FILE) return false;
+    const FRESULT backup = f_rename(GBBP_FILE, GBBP_BACKUP);
+    if (backup != FR_OK && backup != FR_NO_FILE) return false;
+    if (f_rename(GBBP_TEMP, GBBP_FILE) != FR_OK) {
+        if (backup == FR_OK) f_rename(GBBP_BACKUP, GBBP_FILE);
+        return false;
+    }
+    if (backup == FR_OK) f_unlink(GBBP_BACKUP);
+    return true;
 }
 
 static bool gbbp_try_install(const char* pathname) {
@@ -2149,16 +2181,18 @@ static bool gbbp_try_install(const char* pathname) {
     const int window_w = (int)TEXTMODE_COLS < 43 ? (int)TEXTMODE_COLS : 43;
     const int window_y = (TEXTMODE_ROWS - 5) / 2;
     const int window_x = ((int)TEXTMODE_COLS - window_w) / 2;
-    draw_window("Backplan", window_x, window_y, window_w, 5);
+    draw_window("Backplane", window_x, window_y, window_w, 5);
 
     static FIL src, dst; // static: core 0 has a small stack
-    const char* message = "This backplan version is unsupported";
-    bool installed = false;
+    const char* message = "This backplane version is unsupported";
+    bool staged = false;
+    bool copied = false;
     if (f_open(&src, pathname, FA_READ) == FR_OK) {
         if (gbbp_header_ok(&src)) {
-            message = "ERROR: can't write the backplan";
+            message = "ERROR: can't write the backplane";
             config_mkdirs();
-            if (f_lseek(&src, 0) == FR_OK && f_open(&dst, GBBP_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+            if (f_lseek(&src, 0) == FR_OK && f_open(&dst, GBBP_TEMP, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+                staged = true;
                 static uint8_t chunk[512]; // one sector: f_read/f_write go through the FIL buffer anyway
                 bool ok = true;
                 for (UINT br = 1; ok && br;) {
@@ -2166,19 +2200,26 @@ static bool gbbp_try_install(const char* pathname) {
                     ok = f_read(&src, chunk, sizeof chunk, &br) == FR_OK &&
                          f_write(&dst, chunk, br, &bw) == FR_OK && bw == br;
                 }
-                ok = f_close(&dst) == FR_OK && ok;
-                if (ok) {
-                    message = "Backplan is installed";
-                    installed = true;
-                }
-                else {
-                    f_unlink(GBBP_FILE);
-                }
+                copied = f_close(&dst) == FR_OK && ok;
             }
         }
-        f_close(&src);
+        copied = f_close(&src) == FR_OK && copied;
     }
-    if (installed) apply_backplane();
+    const bool installed = copied && gbbp_commit_install();
+    if (installed) {
+        message = "Custom backplane installed";
+        backplane_custom_available = true;
+        backplane_skin = BACKPLANE_CUSTOM;
+        apply_backplane();
+        f_save_conf();
+    } else if (staged) {
+        f_unlink(GBBP_TEMP);
+        backplane_custom_available = gbbp_custom_exists();
+        if (!backplane_custom_available && backplane_skin == BACKPLANE_CUSTOM) {
+            backplane_skin = BACKPLANE_GREEN;
+            apply_backplane();
+        }
+    }
     draw_text(message, window_x + 1, window_y + 2, installed ? 10 : 13, 1);
     sleep_ms(2000);
     return true;
@@ -2515,7 +2556,6 @@ static void apply_game_palette_on_load() {
     }
 }
 
-static void f_save_conf(void);
 
 /* ---- the palette editor: the 12 colours as 3 rows (BG, OBJ0, OBJ1) of 4 ---- */
 static constexpr int PE_W = LCD_WIDTH / 4;  // 40
@@ -2869,7 +2909,7 @@ static bool handle_palette_hotkeys() {
 const MenuItem menu_items[] = {
     //{ "Player 1: %s",        ARRAY, &player_1_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
     //{ "Player 2: %s",        ARRAY, &player_2_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
-    { "Swap AB <> BA: %s", ARRAY, &swap_ab,  nullptr, 1, {"NO ", "YES"}},
+    { "Swap AB <> BA:  %s", ARRAY, &swap_ab,  nullptr, 1, {"NO ", "YES"}},
     { "Palette:      %s", ARRAY, &palette_all, nullptr, PALETTE_CUSTOM,
         { PALETTE_NAMES }
     },
@@ -2882,17 +2922,17 @@ const MenuItem menu_items[] = {
     { "  OBJ1:       %s", ARRAY, &palette_index[LAYER_OBJ1], nullptr, PALETTE_CUSTOM,
         { PALETTE_NAMES }
     },
-    { "16 shades: %s", ARRAY, &palette16_select, nullptr, PALETTE16_CUSTOM,
+    { "16 shades:      %s", ARRAY, &palette16_select, nullptr, PALETTE16_CUSTOM,
       { "OFF    ", "GRAY   ", "RED    ", "ORANGE ", "GREEN  ", "BLUE   ", "PURPLE ",
         "OGBP   ", "OGBR   ", "GBPR   ", "GBPO   ", "BPRO   ", "BROG   ", "PROG   ",
         "POGR   ", "ROGB   ", "ROGP   ", "CUSTOM " } },
     { "Palette editor", PALETTE_EDITOR },
     { "", GAME_INI, nullptr, &game_ini_action },
-    { "LCD ghosting: %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
+    { "LCD ghosting:   %s", ARRAY, &lcd_ghosting, nullptr, 1, { "OFF", "ON " } },
     {},
-    { "Demo time: %s", ARRAY, &demo_duration, nullptr, 7,
+    { "Demo time:      %s", ARRAY, &demo_duration, nullptr, 7,
       { "15 sec", "30 sec", "45 sec", "1 min ", "2 min ", "3 min ", "5 min ", "10 min" } },
-    { "Demo name OSD: %s", ARRAY, &demo_name, nullptr, 1, { "OFF", "ON " } },
+    { "Demo name OSD:  %s", ARRAY, &demo_name, nullptr, 1, { "OFF", "ON " } },
     { "Demo timer OSD: %s", ARRAY, &demo_timer_osd, nullptr, 1, { "OFF", "ON " } },
     { "Save state: %i", INT, &save_slot, &save, 8 },
     { "Load state: %i", INT, &save_slot, &load, 8 },
@@ -2902,10 +2942,21 @@ const MenuItem menu_items[] = {
     { "Colors: %s", ARRAY, &tv_color, nullptr, 1, { "NO ", "YES" } },
 #endif
 #if VGA || HDMI || SOFTTV
+#if !BACKPLANE
     { "" },
-    { "Screen: %s", ARRAY, &screen_scale, nullptr, 2, { "2x  ", "3x  ", "Full" } },
+#endif
+    { "Screen:     %s", ARRAY, &screen_scale, nullptr, 2, { "2x  ", "3x  ", "Full" } },
 #if BACKPLANE
-    { "Backplane: %s", ARRAY, &backplane, nullptr, 1, { "OFF", "ON " } },
+    { "Backplane:  %s", ARRAY, &backplane, nullptr, 1, { "OFF", "ON " } },
+    { "Skin:       %s", ARRAY, &backplane_skin, nullptr, BACKPLANE_CUSTOM,
+      {
+        "GREEN           ",
+        "PURPLE          ",
+        "GREEN + WHITE   ",
+        "GREEN + WHITE 3x",
+        "CUSTOM          "
+      }
+    },
 #endif
 #endif
 #if VGA
@@ -2916,7 +2967,9 @@ const MenuItem menu_items[] = {
 #if VGA || HDMI
     { "Gray level: %s", ARRAY, &gray_level, nullptr, 3, { "0", "1", "2", "3" } },
 #endif
+#if !BACKPLANE
     {},
+#endif
 {
     "Overclocking: %s MHz", ARRAY, &frequency_index, &overclock, count_of(frequencies) - 1,
 #if CPU_FREQ >= 504
@@ -2966,6 +3019,8 @@ static void f_load_conf(void) {
             else if (!strcmp(line, "gray_level")) gray_level = d <= 3 ? (uint8_t)d : 1;
 #if BACKPLANE
             else if (!strcmp(line, "backplane")) backplane = d ? 1 : 0;
+            else if (!strcmp(line, "backplane_skin"))
+                backplane_skin = d <= BACKPLANE_CUSTOM ? (uint8_t)d : BACKPLANE_GREEN;
 #endif
             else if (!strcmp(line, "palette_all")) palette_all = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
             else if (!strcmp(line, "palette_list")) palette_list = d;
@@ -3018,6 +3073,11 @@ static void f_load_conf(void) {
     gray_lines_menu = gray_lines ? 1 : 0;
     gray_lines = gray_lines_menu ? GRAPHICS_GRAY_HORIZONTAL : 0;
 #endif
+#if BACKPLANE
+    backplane_custom_available = gbbp_custom_exists();
+    if (!backplane_custom_available && backplane_skin == BACKPLANE_CUSTOM)
+        backplane_skin = BACKPLANE_GREEN;
+#endif
     for (unsigned layer = 0; layer < LAYER_COUNT; layer++) randomize_layer(layer);
 }
 
@@ -3048,7 +3108,8 @@ static void f_save_conf(void) {
                         (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level, PALETTE_LIST_VERSION);
 #if BACKPLANE
     if (len > 0 && len < (int)sizeof text)
-        len += snprintf(text + len, sizeof text - len, "backplane=%u\r\n", (unsigned)backplane);
+        len += snprintf(text + len, sizeof text - len, "backplane=%u\r\nbackplane_skin=%u\r\n",
+                        (unsigned)backplane, (unsigned)backplane_skin);
 #endif
     if (len <= 0 || len >= (int)sizeof text) return;
     static FIL f; // static: core 0 has a small stack
@@ -3244,6 +3305,7 @@ static bool menu_item_selectable(const unsigned i) {
         if (item.value == &palette_index[layer]) return palette_all == PALETTE_CUSTOM;
 #if BACKPLANE
     if (item.value == &backplane) return screen_scale != GRAPHICS_SCALE_STRETCH; // Full has none
+    if (item.value == &backplane_skin) return backplane && screen_scale != GRAPHICS_SCALE_STRETCH;
 #endif
 #if VGA
     if (item.value == &gray_lines) return screen_scale != GRAPHICS_SCALE_STRETCH;
@@ -3301,7 +3363,12 @@ void menu() {
                         if (item->max_value != 0) {
                             auto* value = (uint8_t *)item->value;
                             const uint8_t old = *value;
-                            if ((pressed & BTN_RIGHT) && *value < item->max_value) {
+                            uint8_t max_value = item->max_value;
+#if BACKPLANE
+                            if (item->value == &backplane_skin && !backplane_custom_available)
+                                max_value = BACKPLANE_GREEN_WHITE_3X;
+#endif
+                            if ((pressed & BTN_RIGHT) && *value < max_value) {
                                 (*value)++;
                             }
                             if ((pressed & BTN_LEFT) && *value > 0) {

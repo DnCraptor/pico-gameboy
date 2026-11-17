@@ -107,7 +107,14 @@ void graphics_set_hmix(const uint8_t* mix12, const uint8_t* base);
 #endif
 #define BACKPLANE_H 240
 extern uint8_t* volatile backplane_cells;
-void graphics_set_backplane(bool on, enum graphics_scale_t scale); // the built-in one
+enum backplane_skin_t {
+    BACKPLANE_GREEN,
+    BACKPLANE_PURPLE,
+    BACKPLANE_GREEN_WHITE,
+    BACKPLANE_GREEN_WHITE_3X,
+    BACKPLANE_CUSTOM,
+};
+void graphics_set_backplane(bool on, enum graphics_scale_t scale, enum backplane_skin_t skin);
 /* a loaded one: fill backplane_buffer() with colour numbers 0..31, then show it */
 #define BACKPLANE_LOADED_COLORS 32
 uint8_t* backplane_buffer(void);

@@ -34,7 +34,7 @@ RAM).
 - PWM, I2S and hardware AY-3-8910 / TurboSound sound
 - QSPI PSRAM for cartridges on RP2350 modules that have it
 - screen sizes 2x, 3x and full screen; a Game Boy Color backplane around
-  the game in 2x and 3x, replaceable from the SD card (`.gbbp`)
+  the game in 2x and 3x, with four built-in skins and SD card support
 - colours for Game Boy (not Color) games: palettes for the background and
   both sprite palettes, random palettes, 16-shade presets, a palette editor,
   per-game palette presets
@@ -110,7 +110,8 @@ Selecting a `.gbbp` file installs it as the backplane (see below).
 | Save state / Load state | the slot |
 | TV system, Colors | TV-SOFT: PAL / NTSC, colour or black and white |
 | Screen | 2x, 3x, Full |
-| Backplane | the picture around the game (2x and 3x) |
+| Backplane | show the picture around the game in 2x and 3x |
+| Skin | Green, Purple, Green/White, Green/White 3x, or an installed custom backplane |
 | Gray lines, Gray level | the LCD grid (VGA, HDMI; 2x and 3x) |
 | Overclocking | the CPU clock |
 | Game Genie | toggle cheats or enter a code for the current game |
@@ -164,14 +165,13 @@ Game Boy Color games keep their own colours.
 
 - **Screen**: 2x (160×144 → 320×288 pixels), 3x (480×432) or Full (the
   whole 640×480 screen). TV-SOFT uses the same choices.
-- **Backplane**: a photographic Game Boy Color case around the game in 2x
-  and 3x (HDMI, VGA, TV-SOFT on RP2350). Another backplane is installed by
-  selecting a `.gbbp` file in the cartridge browser: "Backplan is installed"
-  — it is copied to `/.config/gbc/backplane.gbbp` and shown from then on;
-  "This backplan version is unsupported" — a file of another version. Delete
-  that file to get the built-in one back. Backplanes are made from any
-  picture by `tools/make_gbbp.py` ([`tools/README.md`](tools/README.md));
-  ready ones are in `sd-card/GB`.
+- **Backplane**: the Game Boy Color picture around the game in 2x
+  and 3x (HDMI, VGA, TV-SOFT on RP2350). **Skin** selects Green, Purple,
+  Green/White or Green/White 3x. Selecting a `.gbbp` in the cartridge
+  browser installs it to `/.config/gbc/backplane.gbbp` and selects
+  **CUSTOM**. You can switch back to it after using a built-in skin.
+  `tools/make_gbbp.py` creates custom backplanes from pictures
+  ([`tools/README.md`](tools/README.md)).
 - **LCD ghosting**: the Game Boy screen is slow, so games draw a sprite every
   second frame to make it half-transparent. The emulator mixes every frame
   of a Game Boy (not Color) game with the previous one; without it such
@@ -249,7 +249,7 @@ read once if there is no `config.ini`.
 closed): `swap_ab`, `tv_system`, `tv_color`, `screen`, `palette_all`,
 `palette0..2`, `custom0..2` (`RRGGBB,RRGGBB,RRGGBB,RRGGBB`), `palette16`,
 `lcd_ghosting`, `demo_duration`, `demo_name`, `demo_timer_osd`,
-`backplane`, `gray_lines`, `gray_level`, `palette_list` (the numbering of
+`backplane`, `backplane_skin`, `gray_lines`, `gray_level`, `palette_list` (the numbering of
 the palettes: without `palette_list=2` the numbers after DMG are those
 from before the Super Game Boy palettes and are moved up by 30). Unknown
 keys are ignored.
@@ -257,7 +257,9 @@ keys are ignored.
 ## Building
 
 The [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.2.0
-is required (or the Raspberry Pi Pico VS Code extension).
+is required (or the Raspberry Pi Pico VS Code extension). RP2350 builds
+with HDMI, VGA or TV-SOFT also use Python 3 to pack the four built-in
+backplanes from `sd-card/GB`. The generator uses the standard library.
 
 ```sh
 cmake -S . -B build -DPICO_BOARD=murmulator -DVGA=ON -DHDMI=OFF -DI2S=OFF

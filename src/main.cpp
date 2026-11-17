@@ -993,7 +993,7 @@ void read_cart_ram_file(struct gb_s* gb) {
  * Write a save file to the SD card
  */
 void write_cart_ram_file(struct gb_s* gb) {
-    char filename[16];
+    char filename[17];
     uint_fast32_t save_size;
     UINT bw;
 
@@ -1667,6 +1667,7 @@ enum menu_type_e {
     START_DEMO,
     GAME_INI,
     PALETTE_EDITOR,
+    RETURN_TO_LAUNCHER,
     RETURN,
 };
 
@@ -2348,7 +2349,7 @@ static void update_palette() {
             // AUTO / a GBC boot palette: the colours this palette gets there
             if (!gbc_palette_ready || gbc_palette_of != sel) {
                 if (sel == PALETTE_AUTO) {
-                    char rom_title[16];
+                    char rom_title[17];
                     auto_assign_palette(palette16, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title));
                 }
                 else {
@@ -2917,6 +2918,7 @@ const MenuItem menu_items[] = {
 { "Press START / Enter to apply", NONE },
     { "Start Demo", START_DEMO },
     { "Reset to ROM select", ROM_SELECT },
+    { "Return to launcher", RETURN_TO_LAUNCHER },
     { "Return to game", RETURN }
 };
 #define MENU_ITEMS_NUMBER (sizeof(menu_items) / sizeof (MenuItem))
@@ -3213,6 +3215,25 @@ void menu() {
                     case RETURN:
                         if (activate)
                             exit = true;
+                        break;
+
+                    case RETURN_TO_LAUNCHER:
+                        if (activate) {
+                            // START held during pico-launcher boot selects USB update mode.
+                            while (input_held() & BTN_START) sleep_ms(10);
+                            prev_keys = input_held();
+                            const FRESULT fr = f_unlink("/.firmware");
+                            if (fr == FR_OK || fr == FR_NO_FILE) {
+                                replay_stop();
+                                f_save_conf();
+                                gb_safe_reset();
+                            } else {
+                                printf("E f_unlink(/.firmware): %s (%d)\n", FRESULT_str(fr), fr);
+                                draw_text("Cannot remove /.firmware", 1, TEXTMODE_ROWS - 1, 12, 1);
+                                sleep_ms(1300);
+                                menu_frame();
+                            }
+                        }
                         break;
 
                     case START_DEMO:

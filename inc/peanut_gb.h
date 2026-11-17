@@ -2043,10 +2043,11 @@ void __gb_draw_line(struct gb_s *gb)
 			}
 		}
 
-		/* Paint lower-priority sprites first, preserving sprite transparency. */
-		for(uint8_t i = number_of_sprites; i; )
+		/* The first opaque OBJ pixel wins, even if the BG hides it. */
+		const uint8_t obj_covered = 0x80;
+		for(uint8_t i = 0; i < number_of_sprites; i++)
 		{
-			const uint8_t s = sprites_to_render[--i].sprite_number;
+			const uint8_t s = sprites_to_render[i].sprite_number;
 			uint8_t py, t1, t2, dir, start, end, shift, disp_x;
 			/* Sprite Y position. */
 			uint8_t OY = gb->oam[s << 2];
@@ -2107,42 +2108,39 @@ void __gb_draw_line(struct gb_s *gb)
 			 * all the pixels in the tile. */
 			for(disp_x = start; disp_x != end; disp_x += dir)
 			{
-				uint8_t c = (t1 & 0x1) | ((t2 & 0x1) << 1);
-				// check transparency / sprite overlap / background overlap
+				const uint8_t c = (t1 & 0x1) | ((t2 & 0x1) << 1);
+				t1 >>= 1;
+				t2 >>= 1;
+
+				const uint8_t bg_priority = pixelsPrio[disp_x];
+				if(!c || (bg_priority & obj_covered))
+					continue;
+				pixelsPrio[disp_x] |= obj_covered;
+
 #if PEANUT_FULL_GBC_SUPPORT
 				if(gb->cgb.cgbMode)
 				{
-					uint8_t isBackgroundDisabled = c && !(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE);
-					uint8_t isPixelPriorityNonConflicting = c &&
-															!(pixelsPrio[disp_x] && (pixels[disp_x] & 0x3)) &&
-															!((OF & OBJ_PRIORITY) && (pixels[disp_x] & 0x3));
+					if((gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE) &&
+							(pixels[disp_x] & 0x3) &&
+							(bg_priority || (OF & OBJ_PRIORITY)))
+						continue;
 
-					if(isBackgroundDisabled || isPixelPriorityNonConflicting)
-					{
-						/* Set pixel colour. */
-						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;  // add 0x20 to differentiate from BG
-					}
+					pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;
+					continue;
 				}
-				else
 #endif
-				if(c && !((OF & OBJ_PRIORITY) && pixelsPrio[disp_x]))
-				{
-					/* Set pixel colour. */
-					pixels[disp_x] = (OF & OBJ_PALETTE)
-						? gb->display.sp_palette[c + 4]
-						: gb->display.sp_palette[c];
+				if((OF & OBJ_PRIORITY) && bg_priority)
+					continue;
+
+				pixels[disp_x] = (OF & OBJ_PALETTE)
+					? gb->display.sp_palette[c + 4]
+					: gb->display.sp_palette[c];
 #if PEANUT_GB_12_COLOUR
-					/* Set pixel palette (OBJ0 or OBJ1). */
-					pixels[disp_x] |= (OF & OBJ_PALETTE);
+				pixels[disp_x] |= (OF & OBJ_PALETTE);
 #endif
 #if PEANUT_FULL_GBC_SUPPORT
-					/* Deselect BG palette. */
-					pixels[disp_x] &= ~LCD_PALETTE_BG;
+				pixels[disp_x] &= ~LCD_PALETTE_BG;
 #endif
-				}
-
-				t1 = t1 >> 1;
-				t2 = t2 >> 1;
 			}
 		}
 	}
@@ -4259,24 +4257,17 @@ enum gb_init_error_e gb_init(struct gb_s *gb,
 
 const char* gb_get_rom_name(struct gb_s* gb, char *title_str)
 {
-	uint_fast16_t title_loc = 0x134;
-	/* End of title may be 0x13E for newer games. */
-	//const uint_fast16_t title_end = 0x14в;
 	const char* title_start = title_str;
+	const uint8_t cgb_flag = gb->gb_rom_read(gb, ROM_TITLE_END_ADDR);
+	const uint_fast16_t title_end = ROM_TITLE_END_ADDR - ((cgb_flag & 0x80) != 0);
 
-	for(; title_loc <= title_loc+ 24; title_loc++)
+	for(uint_fast16_t addr = ROM_TITLE_START_ADDR; addr <= title_end; addr++)
 	{
-		const char title_char = gb->gb_rom_read(gb, title_loc);
-        if (title_char == '\0') break;
+		const char c = gb->gb_rom_read(gb, addr);
+		if(c == '\0')
+			break;
 
-		if((title_char >= '0' && title_char <= '9') || (title_char >= 'A' && title_char <= 'Z'))
-		{
-                *title_str = title_char;
-
-		} else {
-            *title_str = '_';
-        }
-        title_str++;
+		*title_str++ = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) ? c : '_';
 	}
 
 	*title_str = '\0';
@@ -4467,7 +4458,7 @@ uint8_t gb_colour_hash(struct gb_s *gb);
  * Returns the title of ROM.
  *
  * \param gb	An initialised emulator context. Must not be NULL.
- * \param title_str Allocated string at least 16 characters.
+ * \param title_str Buffer of at least 17 bytes, including the terminator.
  * \returns	Pointer to start of string, null terminated.
  */
 const char* gb_get_rom_name(struct gb_s* gb, char *title_str);

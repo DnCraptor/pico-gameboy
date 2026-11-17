@@ -778,6 +778,19 @@ struct gb_s
 static uint8_t gb_vblank_irq_delayed = 0;
 static uint8_t gb_vblank_irq_wait = 0;
 
+#if ENABLE_LCD
+/* The scanline renderer is called at HBlank. Keep palette changes made
+ * during transfer so it can shade pixels with the palette they saw. */
+static struct {
+	uint8_t initial;
+	uint8_t count;
+	struct {
+		uint8_t dot;
+		uint8_t palette;
+	} writes[(LCD_MODE_0_CYCLES - LCD_MODE_3_CYCLES) / 4];
+} gb_dmg_bgp;
+#endif
+
 uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 {
 	switch(PEANUT_GB_GET_MSN16(addr))
@@ -1305,6 +1318,21 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		/* DMG Palette Registers */
 		case 0x47:
+#if ENABLE_LCD
+#if PEANUT_FULL_GBC_SUPPORT
+			if(!gb->cgb.cgbMode)
+#endif
+			if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_TRANSFER &&
+					val != gb->hram_io[IO_BGP] &&
+					gb_dmg_bgp.count < sizeof gb_dmg_bgp.writes / sizeof gb_dmg_bgp.writes[0])
+			{
+				auto& write = gb_dmg_bgp.writes[gb_dmg_bgp.count++];
+				/* The CPU updates registers before advancing the LCD clock.
+				 * Place the write one M-cycle into the instruction. */
+				write.dot = gb->counter.lcd_count + 4;
+				write.palette = val;
+			}
+#endif
 			gb->hram_io[IO_BGP] = val;
 			gb->display.bg_palette[0] = (gb->hram_io[IO_BGP] & 0x03);
 			gb->display.bg_palette[1] = (gb->hram_io[IO_BGP] >> 2) & 0x03;
@@ -2015,6 +2043,27 @@ void __gb_draw_line(struct gb_s *gb)
 		}
 
 		gb->display.window_clear++; // advance window line
+	}
+
+	/* Apply the changing DMG palette before OBJ priority and color
+	 * selection. pixelsPrio still holds the unpaletted BG/Window IDs. */
+	if(gb_dmg_bgp.count && (gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE))
+	{
+		/* Match the fixed-length transfer model: 12 startup dots, then
+		 * the fine-scroll discard. There are no per-OBJ fetch stalls. */
+		const int first_dot = LCD_MODE_3_CYCLES + 12 + (gb->hram_io[IO_SCX] & 7);
+		uint8_t palette = gb_dmg_bgp.initial;
+		int x = 0;
+		for(unsigned i = 0; i <= gb_dmg_bgp.count; i++)
+		{
+			const int end = i == gb_dmg_bgp.count ? LCD_WIDTH :
+				MIN(LCD_WIDTH, gb_dmg_bgp.writes[i].dot - first_dot);
+			for(; x < end; x++)
+				pixels[x] = (pixels[x] & ~0x03) | ((palette >> (pixelsPrio[x] * 2)) & 0x03);
+			if(x == LCD_WIDTH)
+				break;
+			palette = gb_dmg_bgp.writes[i].palette;
+		}
 	}
 
 	// draw sprites
@@ -3964,6 +4013,11 @@ void __gb_step_cpu(struct gb_s *gb)
 		{
 			gb->hram_io[IO_STAT] =
 				(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_SEARCH_TRANSFER;
+
+#if ENABLE_LCD
+			gb_dmg_bgp.initial = gb->hram_io[IO_BGP];
+			gb_dmg_bgp.count = 0;
+#endif
 
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE_0_CYCLES)

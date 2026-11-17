@@ -1082,7 +1082,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 				val &= 0x0F;
 				gb->gb_cart_ram_write(gb, addr, val);
 			}
-			else if(gb->cart_mode_select &&
+			else if((gb->cart_mode_select || gb->mbc != 1) &&
 					gb->cart_ram_bank < gb->num_ram_banks)
 			{
 				gb->gb_cart_ram_write(gb,

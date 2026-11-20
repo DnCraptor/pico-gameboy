@@ -1285,13 +1285,10 @@ static bool demo_begin() {
     demo_active = true;
     demo_advance_pending = false;
     if (demo_load_next_rom(nullptr)) return true;
-    // A directory consisting of subdirectories cannot start a demo there;
-    // try the regular ROM root as well, without changing the browser's path.
-    if (strcmp(demo_dir, HOME_DIR) != 0) {
-        snprintf(demo_dir, sizeof demo_dir, "%s", HOME_DIR);
-        if (demo_load_next_rom(nullptr)) return true;
-    }
     demo_active = false;
+    draw_window("Demo", 0, 0, TEXTMODE_COLS, 5);
+    draw_text("No playable ROMs here", 1, 2, 12, 1);
+    sleep_ms(1300);
     return false;
 }
 
@@ -1380,10 +1377,12 @@ void filebrowser(const char* executables) {
             total_files++;
         }
 
-        while (f_readdir(&dir, &fileInfo) == FR_OK &&
-               fileInfo.fname[0] != '\0' &&
-               total_files < max_files
-        ) {
+        bool files_truncated = false;
+        while (f_readdir(&dir, &fileInfo) == FR_OK && fileInfo.fname[0] != '\0') {
+            if (total_files == max_files) {
+                files_truncated = true;
+                break;
+            }
             // Set the file item properties
             fileItems[total_files].is_directory = fileInfo.fattrib & AM_DIR;
             fileItems[total_files].size = fileInfo.fsize;
@@ -1397,7 +1396,7 @@ void filebrowser(const char* executables) {
 
         qsort(fileItems, total_files, sizeof(file_item_t), compareFileItems);
 
-        if (total_files > max_files) {
+        if (files_truncated) {
             draw_text(" Too many files!! ", TEXTMODE_COLS - 17, 0, 12, 3);
         }
 

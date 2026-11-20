@@ -208,8 +208,12 @@ rewritten.
 
 ## Demo mode
 
-**Start Demo** in the menu, or B in the browser, plays the cartridges of a
-directory one after another, each for the **Demo time** (15 s … 10 min).
+**Start Demo** in the menu, or B in the browser, plays the cartridges of the
+current browser directory one after another, each for the **Demo time**
+(15 s … 10 min). Subdirectories are not scanned. An empty directory or one
+without playable cartridges shows a message and returns to the browser.
+Demo scans the directory directly, beyond the browser's display limit of
+500 entries on RP2350 or 256 on RP2040 (including the parent directory entry).
 **Demo name OSD** shows the title for the first seconds, **Demo timer OSD**
 the remaining time. Any manually chosen cartridge ends the demo.
 

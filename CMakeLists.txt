@@ -16,8 +16,8 @@ cmake_minimum_required(VERSION 3.13...3.23)
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards )
 #set(PICO_PLATFORM "rp2040" CACHE STRING "Chip type")
 set(PICO_PLATFORM "rp2350" CACHE STRING "Chip type")
-#set(PICO_BOARD "murmulator" CACHE STRING "Board type")
-set(PICO_BOARD "murmulator2" CACHE STRING "Board type")
+set(PICO_BOARD "murmulator" CACHE STRING "Board type")
+#set(PICO_BOARD "murmulator2" CACHE STRING "Board type")
 #set(PICO_BOARD "olimex-pico-pc" CACHE STRING "Board type")
 #set(PICO_BOARD "waveshare_rp2350_pizero" CACHE STRING "Board type")
 
@@ -37,7 +37,7 @@ include(pico_sdk_import.cmake)
 project(gameboy-color C CXX ASM)
 # one place for the version: menu footer (PICO_PROGRAM_VERSION_STRING),
 # binary info and the output file name
-set(PICO_GAMEBOY_VERSION "3.3.1")
+set(PICO_GAMEBOY_VERSION "3.3.2")
 SET(BUILD_NAME "${PROJECT_NAME}")
 
 option(I2S "Enable I2S sound" OFF)
@@ -62,7 +62,7 @@ set(HDMI ON)
 #set(TV ON)
 #set(SOFTTV ON)
 set(USB_HID ON)
-set(CPU_FREQ 504)
+set(CPU_FREQ 252)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -96,6 +96,7 @@ add_executable(${PROJECT_NAME}
         src/game_genie.cpp
         src/hid_app.cpp
         src/psram.c
+        src/clocks.c
 )
 
 

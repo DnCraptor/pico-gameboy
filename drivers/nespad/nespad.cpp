@@ -70,6 +70,12 @@ bool nespad_begin(uint32_t cpu_khz, uint8_t clkPin, uint8_t dataPin,uint8_t latP
   return false;
 }
 
+// clk_sys has changed: the state machine keeps its 1 MHz
+void nespad_reclock(uint32_t cpu_khz) {
+  if (sm < NUM_PIO_STATE_MACHINES)
+    pio_sm_set_clkdiv_int_frac(pio, sm, cpu_khz / 1000, 0);
+}
+
 
 
 // nespad read. Ideally should be called ~100 uS after

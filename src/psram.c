@@ -20,6 +20,8 @@
 static bool psram_available;
 static size_t psram_size;
 static int psram_cs_gpio = -1;
+static uint32_t psram_max_hz = GB_PSRAM_DEFAULT_MHZ * 1000000u; /* the menu limit */
+static uint32_t psram_clock_hz;                                  /* in use */
 
 #define GB_PSRAM_UNCACHED_BASE ((uintptr_t)0x15000000u)
 
@@ -105,18 +107,25 @@ static size_t psram_detect_size(void) {
 
 static void __no_inline_not_in_flash_func(psram_set_timing)(void) {
     const int clock_hz = (int)clock_get_hz(clk_sys);
-    const int max_psram_freq = 133 * 1000000;
+    const int max_psram_freq = (int)psram_max_hz;
     int divisor = (clock_hz + max_psram_freq - 1) / max_psram_freq;
     if (divisor == 1 && clock_hz > 100000000)
         divisor = 2;
+    if (divisor > 255)
+        divisor = 255;
     int rxdelay = divisor;
     if (clock_hz / divisor > 100000000)
         rxdelay += 1;
+    if (rxdelay > 7) // a 3-bit field: a slow PSRAM limit gives divisors above it
+        rxdelay = 7;
 
     const int64_t clock_period_fs = 1000000000000000ll / clock_hz;
     const int max_select = (125 * 1000000) / clock_period_fs;
-    const int min_deselect =
+    int min_deselect =
         (18 * 1000000 + (clock_period_fs - 1)) / clock_period_fs - (divisor + 1) / 2;
+    if (min_deselect < 0)
+        min_deselect = 0;
+    psram_clock_hz = (uint32_t)(clock_hz / divisor);
 
     qmi_hw->m[1].timing =
         1u << QMI_M1_TIMING_COOLDOWN_LSB |
@@ -212,6 +221,15 @@ void gb_psram_reclock(void) {
         psram_set_timing();
 }
 
+void gb_psram_set_max_mhz(uint32_t mhz) {
+    if (mhz)
+        psram_max_hz = mhz * 1000000u;
+}
+
+uint32_t gb_psram_clock_hz(void) {
+    return psram_available ? psram_clock_hz : 0;
+}
+
 void __no_inline_not_in_flash_func(gb_psram_prepare_reset)(void) {
     if (!psram_available)
         return;
@@ -256,6 +274,14 @@ int gb_psram_cs1_gpio(void) {
 }
 
 void gb_psram_reclock(void) {
+}
+
+void gb_psram_set_max_mhz(uint32_t mhz) {
+    (void)mhz;
+}
+
+uint32_t gb_psram_clock_hz(void) {
+    return 0;
 }
 
 void gb_psram_prepare_reset(void) {

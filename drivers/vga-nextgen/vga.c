@@ -671,6 +671,15 @@ void graphics_set_palette(const uint8_t i, const uint32_t color888) {
     palette[1][i] = (c_lo << 8 | c_hi) & 0x3f3f | palette16_mask;
 }
 
+/* the 25.175 MHz pixel clock at any clk_sys; graphics_set_mode() sets the
+ * divider only once, when it allocates the line patterns */
+void graphics_reclock(void) {
+    if (_SM_VGA < 0 || !lines_pattern_data) return;
+    const double fdiv = clock_get_hz(clk_sys) / 25175000.0;
+    const uint32_t div32 = (uint32_t)(fdiv * (1 << 16) + 0.0);
+    PIO_VGA->sm[_SM_VGA].clkdiv = div32 & 0xfffff000;
+}
+
 void graphics_init() {
     //инициализация палитры по умолчанию
 #if 1

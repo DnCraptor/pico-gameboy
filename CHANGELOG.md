@@ -1,3 +1,12 @@
+# Unreleased
+- Clocks screen instead of Overclocking: the CPU clock, the flash and the PSRAM clock limits, with the clocks the memories really get (CPU clock / an integer)
+- clocks applied while running: the video, sound, NES pad, PS/2 keyboard, SD card and HW AY clocks follow the CPU clock (before, overclocking from the menu moved the video clock and the monitor lost the picture)
+- clocks saved in config.ini (cpu_freq, flash_freq, psram_freq); SELECT held at power-on starts with the firmware's clocks
+- the flash starts at most at 66 MHz (before: CPU clock / 2..4, 126..144 MHz)
+- every CPU step in every firmware (252 MHz firmwares jumped to 396, 504 MHz ones had only 528)
+- 432 MHz instead of 433, which the PLL cannot make (RP2040 panicked on it)
+- RP2040: the flash divider survives writing a cartridge to flash (boot2 set its own)
+
 # v3.2.9
 - F10 cycles game -> ROM browser -> settings -> game (without a game: browser -> settings -> browser)
 - 30 Super Game Boy palettes from lospec.com after DMG; the palette numbers in config.ini and the game .ini files of older versions are moved up

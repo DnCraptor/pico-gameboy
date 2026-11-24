@@ -194,6 +194,7 @@ static uint32_t lines_buf[N_LINE_BUF][LINE_SIZE_MAX / 4];
 
 
 static int SM_video = -1;
+static double video_pio_hz; // 4x the colour subcarrier, set with the TV system
 
 
 //DMA каналы
@@ -269,10 +270,17 @@ void graphics_set_modeTV(tv_out_mode_t mode) {
     };
     video_mode.LVL_BLACK_TMPL = CONV_DAC(video_mode.LVL_BLACK) | (1 << SYNC_PIN);
 
+    video_pio_hz = color_freq * 4;
     if (SM_video >= 0) // the state machine is claimed in graphics_init()
-        pio_sm_set_clkdiv(PIO_VIDEO, SM_video, clock_get_hz(clk_sys) / (color_freq * 4));
+        pio_sm_set_clkdiv(PIO_VIDEO, SM_video, clock_get_hz(clk_sys) / video_pio_hz);
 
 };
+
+/* the subcarrier-locked sample clock at any clk_sys */
+void graphics_reclock(void) {
+    if (SM_video >= 0 && video_pio_hz > 0)
+        pio_sm_set_clkdiv(PIO_VIDEO, SM_video, clock_get_hz(clk_sys) / video_pio_hz);
+}
 
 
 static uint32_t cbNORM[2][10]; //цветовая вспышка 80байт

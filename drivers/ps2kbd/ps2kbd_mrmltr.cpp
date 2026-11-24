@@ -426,3 +426,7 @@ void Ps2Kbd_Mrmltr::init_gpio() {
     pio_sm_init(_pio, _sm, offset, &c);
     pio_sm_set_enabled(_pio, _sm, true);
 }
+
+void Ps2Kbd_Mrmltr::reclock() {
+    pio_sm_set_clkdiv(_pio, _sm, (float)clock_get_hz(clk_sys) / (8 * 16700));
+}

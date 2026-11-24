@@ -211,6 +211,26 @@ void i2s_init(i2s_config_t *i2s_config) {
 }
 
 /**
+ * clk_sys has changed: the sample rate again (the I2S clock divider or the
+ * PWM period).  The PWM samples are 12-bit, below the period at any clock.
+ */
+void i2s_reclock(const i2s_config_t *i2s_config) {
+#ifndef AUDIO_PWM_PIN
+    uint32_t divider = clock_get_hz(clk_sys) * 4 / i2s_config->sample_freq;
+#ifdef I2S_CS4334
+    divider >>= 3;
+#endif
+    pio_sm_set_clkdiv_int_frac(i2s_config->pio, i2s_config->sm, divider >> 8u, divider & 0xffu);
+#elif defined(PICO_PC)
+    const uint16_t wrap = (uint16_t)(clock_get_hz(clk_sys) / i2s_config->sample_freq);
+    pwm_set_wrap(pwm_gpio_to_slice_num(PCPC_PWM_LEFT), wrap);
+    pwm_set_wrap(pwm_gpio_to_slice_num(PCPC_PWM_RIGHT), wrap);
+#else
+    pwm_set_wrap(pwm_gpio_to_slice_num(PWM_PIN0), (uint16_t)(clock_get_hz(clk_sys) / i2s_config->sample_freq));
+#endif
+}
+
+/**
  * Write samples to I2S directly and wait for completion (blocking)
  * i2s_config: I2S context obtained by i2s_get_default_config()
  *     sample: pointer to an array of len x 32 bits samples

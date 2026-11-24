@@ -40,12 +40,14 @@ static inline void hway_wait_to_adjust(uint32_t wait_nops) {
         __asm volatile("nop");
 }
 
+/* the murm386 74HC595 timing: about 30 MHz maximum shift clock, with
+ * setup/hold time around every edge; 0: compute for the current clk_sys */
+static volatile uint32_t hway_wait_nops;
+
 static void __not_in_flash_func(hway_shift16)(uint16_t data) {
-    /* the murm386 74HC595 timing: about 30 MHz maximum shift clock, with
-     * setup/hold time around every edge */
-    static uint32_t wait_nops;
+    uint32_t wait_nops = hway_wait_nops;
     if (wait_nops == 0)
-        wait_nops = clock_get_hz(clk_sys) / (30000000u * 5u);
+        hway_wait_nops = wait_nops = clock_get_hz(clk_sys) / (30000000u * 5u);
 
     gpio_put(HWAY_CLOCK_PIN, 0);
     hway_wait_to_adjust(wait_nops);
@@ -154,6 +156,11 @@ void hway_init(void) {
     __atomic_store_n(&reg_read_pos, 0, __ATOMIC_RELAXED);
     heartbeat_us = time_us_32();
     silenced = 0;
+}
+
+void hway_reclock(void) {
+    hway_wait_nops = clock_get_hz(clk_sys) / (30000000u * 5u);
+    pwm_set_clkdiv(pwm_gpio_to_slice_num(CLK_AY_PIN), (float)clock_get_hz(clk_sys) / (4.0f * HWAY_AY_CLOCK));
 }
 
 void __not_in_flash_func(hway_poll)(void) {

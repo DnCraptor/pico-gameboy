@@ -52,6 +52,9 @@ extern uint8_t* text_buffer;
 
 void graphics_init();
 
+// clk_sys has changed: the video clock divider again (the picture keeps its timing)
+void graphics_reclock(void);
+
 void graphics_set_mode(enum graphics_mode_t mode);
 
 void graphics_set_buffer(uint8_t* buffer, uint16_t width, uint16_t height);

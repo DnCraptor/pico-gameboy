@@ -18,6 +18,7 @@
 
 #include "st7789.pio.h"
 #include "hardware/dma.h"
+#include "hardware/clocks.h"
 
 #ifndef SCREEN_WIDTH
 #define SCREEN_WIDTH 320
@@ -39,6 +40,7 @@
 static uint sm = 0;
 static PIO pio = pio0;
 static uint st7789_chan;
+static uint32_t init_clk_hz; // clk_sys of graphics_init(): SERIAL_CLK_DIV is meant for it
 
 uint16_t __scratch_y("tft_palette") palette[256];
 
@@ -151,9 +153,16 @@ void create_dma_channel() {
     );
 }
 
+/* the serial clock of graphics_init() at any clk_sys */
+void graphics_reclock(void) {
+    if (init_clk_hz)
+        pio_sm_set_clkdiv(pio, sm, SERIAL_CLK_DIV * (float)clock_get_hz(clk_sys) / (float)init_clk_hz);
+}
+
 void graphics_init() {
     const uint offset = pio_add_program(pio, &st7789_lcd_program);
     sm = pio_claim_unused_sm(pio, true);
+    init_clk_hz = clock_get_hz(clk_sys);
     st7789_lcd_program_init(pio, sm, offset, TFT_DATA_PIN, TFT_CLK_PIN, SERIAL_CLK_DIV);
 
     gpio_init(TFT_CS_PIN);

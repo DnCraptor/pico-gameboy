@@ -868,6 +868,12 @@ void tv_init(const output_format_e output_format) {
 };
 
 
+/* the encoder clock of the current TV system at any clk_sys */
+void graphics_reclock(void) {
+    if (SM_video >= 0)
+        pio_sm_set_clkdiv(PIO_VIDEO, SM_video, clock_get_hz(clk_sys) / (2 * v_mode.CLK_SPD));
+}
+
 void graphics_init() {
     tv_init(TV_OUT_NTSC);
 

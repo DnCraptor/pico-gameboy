@@ -71,6 +71,8 @@ static GameGenie game_genie;
 
 #include "ps2kbd_mrmltr.h"
 #include "psram.h"
+#include "clocks.h"
+#include "sdcard.h"
 
 
 /** Definition of ROM data
@@ -1061,10 +1063,10 @@ bool isExecutable(const char pathname[255],const char *extensions) {
 
 #if PICO_RP2350
 /* flash_range_erase/program leave XIP through the boot-time XIP setup, which
- * restores the QMI window-0 timing chosen for the boot clock.  overclock()
+ * restores the QMI window-0 timing chosen for the boot clock.  clocks_set()
  * runs the flash with its own timing at 378+ MHz, so the boot value would
  * clock the flash far too fast afterwards and every XIP fetch would return
- * garbage.  Keep the overclock setup; nothing runs from flash in between. */
+ * garbage.  Keep the clocks_set() setup; nothing runs from flash in between. */
 static void __no_inline_not_in_flash_func(flash_write_sector)(const uint32_t offset, const uint8_t* data) {
     const uint32_t qmi_timing = qmi_hw->m[0].timing;
     const uint32_t qmi_rfmt = qmi_hw->m[0].rfmt;
@@ -1077,9 +1079,12 @@ static void __no_inline_not_in_flash_func(flash_write_sector)(const uint32_t off
     __asm volatile ("dsb; isb" ::: "memory");
 }
 #else
+/* The same on RP2040: XIP comes back through boot2, with its SSI divider
+ * (PICO_FLASH_SPI_CLKDIV), not the one clocks_set() chose for clk_sys. */
 static void __no_inline_not_in_flash_func(flash_write_sector)(const uint32_t offset, const uint8_t* data) {
     flash_range_erase(offset, FLASH_SECTOR_SIZE);
     flash_range_program(offset, data, FLASH_SECTOR_SIZE);
+    clocks_flash_restore();
 }
 #endif
 
@@ -1677,6 +1682,7 @@ enum menu_type_e {
     GAME_INI,
     PALETTE_EDITOR,
     CHEATS,
+    CLOCKS,
     HARD_RESET,
     RETURN,
 };
@@ -1696,46 +1702,99 @@ static int save_slot = 0;
 #ifndef CPU_FREQ
 #define CPU_FREQ 378
 #endif
-#define FREQ_STR_(x) #x
-#define FREQ_STR(x) FREQ_STR_(x)
-#if CPU_FREQ >= 504
-static uint16_t frequencies[] = { CPU_FREQ, 528 };
-#else
-static uint16_t frequencies[] = { CPU_FREQ, 396, 404, 408, 412, 416, 420, 424, 433 };
-#endif
-static uint8_t frequency_index = 0;
 
+/* The clocks of the menu, MHz.  clk_sys: the PLL makes every step exactly
+ * (432, not 433: the PLL cannot make 433 MHz, set_sys_clock_khz() refused it
+ * on RP2350 and panicked on RP2040).  The flash and the PSRAM get limits; their
+ * dividers follow clk_sys (clocks.c, psram.c). */
 #if PICO_RP2350
-/* QMI M0 (the flash) timing for clk_sys = clock_hz: the flash clock stays at
- * most 145 MHz (378 / 3 = 126, as before; 504 / 4 = 126) and RXDELAY = CLKDIV
- * keeps the same sampling delay in ns.  The fixed 0x60007303 (CLKDIV 3) ran
- * the flash at 168 MHz at 504 MHz: a black screen. */
-static uint32_t flash_timing_for(const uint32_t clock_hz) {
-    const uint32_t max_flash_hz = 145u * 1000000u;
-    uint32_t divisor = (clock_hz + max_flash_hz - 1u) / max_flash_hz;
-    if (divisor < 2u) divisor = 2u;
-    return 0x60007000u | divisor << QMI_M0_TIMING_RXDELAY_LSB | divisor << QMI_M0_TIMING_CLKDIV_LSB;
+static const uint16_t cpu_freqs[] = { 252, 378, 396, 404, 408, 412, 416, 420, 424, 432, 504, 528 };
+#else
+static const uint16_t cpu_freqs[] = { 252, 378, 396, 404, 408, 412, 416, 420, 424, 432 };
+#endif
+static const uint16_t mem_freqs[] = { 66, 84, 100, 133, 166 }; // flash and PSRAM limits
+
+static uint8_t freq_index(const uint16_t* list, const size_t count, const uint32_t mhz, const uint8_t fallback) {
+    for (size_t i = 0; i < count; i++)
+        if (list[i] == mhz) return (uint8_t)i;
+    return fallback;
 }
+
+// the clocks in use (written to config.ini) ...
+static uint16_t cpu_mhz = CPU_FREQ;
+static uint16_t flash_mhz = CLOCKS_FLASH_DEFAULT_MHZ;
+static uint16_t psram_mhz = GB_PSRAM_DEFAULT_MHZ;
+// ... the ones config.ini asks for (applied once, after the SD card is up) ...
+static uint16_t cfg_cpu_mhz = CPU_FREQ;
+static uint16_t cfg_flash_mhz = CLOCKS_FLASH_DEFAULT_MHZ;
+static uint16_t cfg_psram_mhz = GB_PSRAM_DEFAULT_MHZ;
+// ... and the selection on the Clocks screen (A / START applies all three)
+static uint8_t cpu_index;
+static uint8_t flash_index;
+static uint8_t psram_index;
+// what the flash and the PSRAM really get: clk_sys / an integer divider
+static char clocks_info_flash[32];
+static char clocks_info_psram[32];
+
+#if !HWAY
+static i2s_config_t i2s_config;
 #endif
 
-bool overclock() {
-#if PICO_RP2350
-    const uint32_t target_hz = frequencies[frequency_index] * MHZ;
-    const bool faster = target_hz > clock_get_hz(clk_sys);
-    vreg_disable_voltage_limit();
-    vreg_set_voltage(CPU_FREQ > 378 ? VREG_VOLTAGE_1_70 : VREG_VOLTAGE_1_60);
-    sleep_ms(10);
-    // the slower of the two timings while the clock changes
-    if (faster) qmi_hw->m[0].timing = flash_timing_for(target_hz);
-    const bool res = set_sys_clock_khz(frequencies[frequency_index] * KHZ, false);
-    qmi_hw->m[0].timing = flash_timing_for(clock_get_hz(clk_sys));
-    gb_psram_reclock(); // QMI CS1 timing depends on clk_sys (no-op without PSRAM)
-    return res;
+/* the menu shows the clocks in use, not a selection left unapplied */
+static void clocks_menu_sync() {
+    cpu_index = freq_index(cpu_freqs, count_of(cpu_freqs), cpu_mhz, 0);
+    flash_index = freq_index(mem_freqs, count_of(mem_freqs), flash_mhz, 0);
+    psram_index = freq_index(mem_freqs, count_of(mem_freqs), psram_mhz, 0);
+}
+
+static void clocks_info_update() {
+    const uint32_t clk_mhz = clock_get_hz(clk_sys) / MHZ;
+    const uint32_t flash_hz = clocks_flash_hz();
+    const uint32_t psram_hz = gb_psram_clock_hz();
+    char line[32];
+    // padded: a shorter line must cover the previous one
+    if (flash_hz)
+        snprintf(line, sizeof line, "  flash %lu MHz = %lu/%lu", (unsigned long)((flash_hz + MHZ / 2) / MHZ),
+                 (unsigned long)clk_mhz, (unsigned long)((clock_get_hz(clk_sys) + flash_hz / 2) / flash_hz));
+    else
+        snprintf(line, sizeof line, "  flash: ?");
+    snprintf(clocks_info_flash, sizeof clocks_info_flash, "%-26s", line);
+    if (psram_hz)
+        snprintf(line, sizeof line, "  PSRAM %lu MHz = %lu/%lu", (unsigned long)((psram_hz + MHZ / 2) / MHZ),
+                 (unsigned long)clk_mhz, (unsigned long)((clock_get_hz(clk_sys) + psram_hz / 2) / psram_hz));
+    else
+        snprintf(line, sizeof line, "  no PSRAM");
+    snprintf(clocks_info_psram, sizeof clocks_info_psram, "%-26s", line);
+}
+
+/* clk_sys and the memory clocks while everything runs.  Core 1 (the video,
+ * the input, maybe running from the flash) waits in RAM while the flash
+ * timing changes; then every divider derived from clk_sys is set again, so
+ * the picture, the sound, the pads and the SD card keep their rates (before,
+ * the video clock moved with clk_sys and the monitor lost the picture). */
+static bool clocks_apply(const uint16_t cpu, const uint16_t flash, const uint16_t psram) {
+    const bool core1 = render_ready; // core 1 has started: the lockout has its victim
+    if (core1) multicore_lockout_start_blocking();
+    const bool ok = clocks_set(cpu, flash);
+    if (ok) {
+        cpu_mhz = cpu;
+        flash_mhz = flash;
+        psram_mhz = psram;
+        gb_psram_set_max_mhz(psram);
+        gb_psram_reclock(); // no-op without PSRAM
+        graphics_reclock();
+#if HWAY
+        hway_reclock();
 #else
-    hw_set_bits(&vreg_and_chip_reset_hw->vreg, VREG_AND_CHIP_RESET_VREG_VSEL_BITS);
-    sleep_ms(33);
-    return set_sys_clock_khz(frequencies[frequency_index] * KHZ, true);
+        i2s_reclock(&i2s_config);
 #endif
+        nespad_reclock(clock_get_hz(clk_sys) / 1000);
+        ps2kbd.reclock();
+        sdcard_reclock();
+    }
+    if (core1) multicore_lockout_end_blocking();
+    clocks_info_update();
+    return ok;
 }
 
 /* The configuration, the game palettes and the saved states live in
@@ -2969,14 +3028,7 @@ const MenuItem menu_items[] = {
 #if !BACKPLANE
     {},
 #endif
-{
-    "Overclocking: %s MHz", ARRAY, &frequency_index, &overclock, count_of(frequencies) - 1,
-#if CPU_FREQ >= 504
-    { FREQ_STR(CPU_FREQ), "528" }
-#else
-    { FREQ_STR(CPU_FREQ), "396", "404", "408", "412", "416", "420", "424", "432" }
-#endif
-},
+{ "Clocks", CLOCKS }, // its own screen: CPU, flash and PSRAM clocks
 { "Press START / Enter to apply", NONE },
     { "Game Genie", CHEATS },
     { "Start Demo", START_DEMO },
@@ -3023,6 +3075,13 @@ static void f_load_conf(void) {
 #endif
             else if (!strcmp(line, "palette_all")) palette_all = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
             else if (!strcmp(line, "palette_list")) palette_list = d;
+            // clocks: only the menu values; anything else keeps the firmware's
+            else if (!strcmp(line, "cpu_freq") && freq_index(cpu_freqs, count_of(cpu_freqs), d, 0xff) != 0xff)
+                cfg_cpu_mhz = (uint16_t)d;
+            else if (!strcmp(line, "flash_freq") && freq_index(mem_freqs, count_of(mem_freqs), d, 0xff) != 0xff)
+                cfg_flash_mhz = (uint16_t)d;
+            else if (!strcmp(line, "psram_freq") && freq_index(mem_freqs, count_of(mem_freqs), d, 0xff) != 0xff)
+                cfg_psram_mhz = (uint16_t)d;
             else if (!strcmp(line, "palette16"))
                 palette16_global = palette16_select = d <= PALETTE16_CUSTOM ? (uint8_t)d : 0;
             else if (!strcmp(line, "custom16")) {
@@ -3105,6 +3164,9 @@ static void f_save_conf(void) {
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\npalette_list=%u\r\n",
                         (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level, PALETTE_LIST_VERSION);
+    if (len > 0 && len < (int)sizeof text)
+        len += snprintf(text + len, sizeof text - len, "cpu_freq=%u\r\nflash_freq=%u\r\npsram_freq=%u\r\n",
+                        (unsigned)cpu_mhz, (unsigned)flash_mhz, (unsigned)psram_mhz);
 #if BACKPLANE
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "backplane=%u\r\nbackplane_skin=%u\r\n",
@@ -3290,6 +3352,62 @@ static void cheat_menu() {
     }
 }
 
+/* The clocks: clk_sys and the limits of the flash and the PSRAM, with what
+ * the memories really get (clk_sys / an integer) under each.  A / START
+ * applies all three while everything runs; they are saved with the settings.
+ * Lines up to 38 characters: TV-SOFT NTSC has about 40 columns. */
+static void clocks_menu() {
+    clocks_menu_sync();
+    clocks_info_update();
+#if PICO_RP2350
+    const unsigned items = gb_psram_available() ? 3 : 2;
+#else
+    const unsigned items = 2;
+#endif
+    unsigned cursor = 0;
+    uint8_t previous = input_held();
+    draw_window("Clocks", 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS);
+    for (;;) {
+        const uint8_t held = input_held();
+        const uint8_t pressed = held & ~previous;
+        previous = held;
+        if ((pressed & BTN_B) || filebrowser_toggle_requested) {
+            filebrowser_toggle_requested = false;
+            return;
+        }
+        if ((pressed & BTN_DOWN) && cursor + 1 < items) ++cursor;
+        if ((pressed & BTN_UP) && cursor) --cursor;
+        uint8_t* const value = cursor == 0 ? &cpu_index : cursor == 1 ? &flash_index : &psram_index;
+        const unsigned max = cursor == 0 ? count_of(cpu_freqs) - 1 : count_of(mem_freqs) - 1;
+        if ((pressed & BTN_RIGHT) && *value < max) ++*value;
+        if ((pressed & BTN_LEFT) && *value) --*value;
+        if (pressed & (BTN_A | BTN_START)) {
+            clocks_apply(cpu_freqs[cpu_index], mem_freqs[flash_index], mem_freqs[psram_index]);
+            clocks_menu_sync(); // a clock the PLL cannot make leaves the old one
+        }
+
+        char line[TEXT_BUFFER_COLS];
+        snprintf(line, sizeof line, "CPU clock:  %3u MHz", (unsigned)cpu_freqs[cpu_index]);
+        draw_text(line, 2, 2, cursor == 0 ? 0 : 7, cursor == 0 ? 15 : 0);
+        snprintf(line, sizeof line, "Flash max:  %3u MHz", (unsigned)mem_freqs[flash_index]);
+        draw_text(line, 2, 4, cursor == 1 ? 0 : 7, cursor == 1 ? 15 : 0);
+        draw_text(clocks_info_flash, 2, 5, 6, 0);
+#if PICO_RP2350
+        snprintf(line, sizeof line, "PSRAM max:  %3u MHz", (unsigned)mem_freqs[psram_index]);
+        draw_text(line, 2, 7, cursor == 2 ? 0 : items > 2 ? 7 : 6, cursor == 2 ? 15 : 0);
+        draw_text(clocks_info_psram, 2, 8, 6, 0);
+#endif
+        draw_text("Left/Right: change  A/Start: apply", 2, 10, 7, 0);
+        draw_text("B: back", 2, 11, 7, 0);
+        draw_text("Flash and PSRAM run at the CPU", 2, 13, 7, 0);
+        draw_text("clock / an integer; \"max\" is the", 2, 14, 7, 0);
+        draw_text("highest clock the chip may get.", 2, 15, 7, 0);
+        draw_text("Select held at power-on starts", 2, 17, 7, 0);
+        draw_text("with the firmware's clocks.", 2, 18, 7, 0);
+        sleep_ms(25);
+    }
+}
+
 
 /* the palettes are chosen one by one only under "Palette: CUSTOM" */
 static bool menu_item_selectable(const unsigned i) {
@@ -3389,8 +3507,10 @@ void menu() {
                         }
                         break;
                     case CHEATS:
+                    case CLOCKS:
                         if (activate && menu_item_selectable(i)) {
-                            cheat_menu();
+                            if (item->type == CHEATS) cheat_menu();
+                            else clocks_menu();
                             char blank[TEXT_BUFFER_COLS + 1];
                             memset(blank, ' ', TEXTMODE_COLS);
                             blank[TEXTMODE_COLS] = '\0';
@@ -3479,6 +3599,11 @@ void menu() {
                     break;
                 case TEXT:
                     snprintf(result, TEXTMODE_COLS, item->text, item->value);
+                    break;
+                case CLOCKS:
+                    // padded: the line is drawn over the previous one
+                    snprintf(result, TEXTMODE_COLS, "Clocks: %u MHz, flash %lu MHz  ", (unsigned)cpu_mhz,
+                             (unsigned long)((clocks_flash_hz() + MHZ / 2) / MHZ));
                     break;
                 case HARD_RESET:
                     snprintf(result, TEXTMODE_COLS, "%s", return_to_launcher ? "Return to launcher" : item->text);
@@ -3576,7 +3701,11 @@ static void game_video_reset() {
 
 int main() {
     detect_flash_size();
-    overclock();
+    /* The firmware's clock with the safe flash limit: every divider below is
+     * derived from clk_sys.  The clocks saved in config.ini follow once the
+     * SD card is up (clocks_apply() then sets the dividers again). */
+    if (!clocks_set(CPU_FREQ, CLOCKS_FLASH_DEFAULT_MHZ))
+        cpu_mhz = (uint16_t)(clock_get_hz(clk_sys) / MHZ);
     /* QMI CS1 setup before core1 starts: the probe briefly blocks XIP */
     gb_psram_init();
 
@@ -3605,8 +3734,8 @@ int main() {
 #if HWAY
     hway_init(); // the AY chips play the sound, nothing paces the emulator
 #else
-    // Initialize I2S sound driver
-    i2s_config_t i2s_config = i2s_get_default_config();
+    // Initialize I2S sound driver (global: clocks_apply() sets its divider again)
+    i2s_config = i2s_get_default_config();
     i2s_config.sample_freq = AUDIO_SAMPLE_RATE;
     i2s_config.dma_trans_count = AUDIO_SAMPLES;
     i2s_volume(&i2s_config, 0);
@@ -3622,6 +3751,12 @@ int main() {
         f_mkdir(HOME_DIR);
         f_load_conf();
         apply_video_settings();
+        /* The clocks of config.ini.  SELECT (Backspace / Esc, the pad's
+         * Select) held at power-on keeps the firmware's ones, for a board
+         * that hangs with the saved clocks; the next save then writes them. */
+        if (!(input_held() & BTN_SELECT) &&
+            (cfg_cpu_mhz != cpu_mhz || cfg_flash_mhz != flash_mhz || cfg_psram_mhz != psram_mhz))
+            clocks_apply(cfg_cpu_mhz, cfg_flash_mhz, cfg_psram_mhz);
     }
 
     bool browser_rom_preloaded = false;

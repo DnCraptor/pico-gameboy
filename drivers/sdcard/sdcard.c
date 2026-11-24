@@ -87,8 +87,13 @@ static inline void cs_deselect(uint cs_pin) {
     asm volatile("nop \n nop \n nop"); // FIXME
 }
 
+/* the SPI clock asked for last: clk_peri follows clk_sys, so the prescaler
+ * is set again after every clk_sys change (sdcard_reclock) */
+static uint32_t sd_baudrate = CLK_SLOW;
+
 static void FCLK_SLOW(void)
 {
+    sd_baudrate = CLK_SLOW;
 #ifndef SDCARD_PIO
     spi_set_baudrate(SDCARD_SPI_BUS, CLK_SLOW);
 #endif
@@ -96,8 +101,16 @@ static void FCLK_SLOW(void)
 
 static void FCLK_FAST(void)
 {
+    sd_baudrate = CLK_FAST;
 #ifndef SDCARD_PIO
     spi_set_baudrate(SDCARD_SPI_BUS, CLK_FAST);
+#endif
+}
+
+void sdcard_reclock(void)
+{
+#ifndef SDCARD_PIO
+    spi_set_baudrate(SDCARD_SPI_BUS, sd_baudrate);
 #endif
 }
 

@@ -797,6 +797,12 @@ void graphics_set_buffer(uint8_t* buffer, uint16_t width, uint16_t height) {
 
 
 //выделение и настройка общих ресурсов - 4 DMA канала, PIO программ и 2 SM
+/* the TMDS state machine keeps 252 MHz (25.2 MHz pixels) at any clk_sys */
+void graphics_reclock(void) {
+    if (SM_video >= 0)
+        pio_sm_set_clkdiv(PIO_VIDEO, SM_video, clock_get_hz(clk_sys) / 252000000.0f);
+}
+
 void graphics_init() {
     //настройка PIO
 #if beginHDMI_PIN_data >= 32

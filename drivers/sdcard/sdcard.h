@@ -20,8 +20,17 @@
 #define SDCARD_PIN_SPI0_MOSI   19
 #endif
 
-#ifndef SDCARD_PIN_SPI0_MISO 
+#ifndef SDCARD_PIN_SPI0_MISO
 #define SDCARD_PIN_SPI0_MISO   16
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* clk_sys (and so clk_peri) has changed: the SPI clock again */
+void sdcard_reclock(void);
+#ifdef __cplusplus
+}
 #endif
 
 #endif // _SDCARD_H_

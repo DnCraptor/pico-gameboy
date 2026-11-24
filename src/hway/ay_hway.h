@@ -8,6 +8,8 @@ extern "C" {
 #define HWAY_AY_CLOCK 1750000u /* Hz, the AY master clock (as in PICO-BK) */
 
 void hway_init(void);
+/* clk_sys has changed (core 1 waits): the AY clock and the bus timing again */
+void hway_reclock(void);
 /* core 0: queue a register write (the bus itself belongs to core 1) */
 void hway_write_register(unsigned chip, uint8_t reg, uint8_t value);
 /* core 0, every emulated frame: the sound is alive */

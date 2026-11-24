@@ -95,6 +95,11 @@ static uint32_t __uninitialized_ram(rom_magic);
 static uint32_t __uninitialized_ram(rom_in_psram);
 static uint32_t __uninitialized_ram(rom_psram_size);
 
+/* Ctrl+Home: a watchdog reset that starts with the firmware's clocks (for
+ * saved clocks that leave no picture); survives the reset like the above. */
+#define CLOCKS_RESET_MAGIC 0x4B4C4352u
+static volatile uint32_t __uninitialized_ram(clocks_reset_magic);
+
 /* Flash is an external chip, its size does not depend on the board header.
  * Read it from JEDEC ID (0x9F) like murmulator_os2: the third ID byte is
  * log2(capacity).  Called first thing in main(), before overclocking. */
@@ -387,6 +392,11 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
     ctrlPressed = isInReport(report, HID_KEY_CONTROL_LEFT) || isInReport(report, HID_KEY_CONTROL_RIGHT);
 
     if (altPressed && ctrlPressed && isInReport(report, HID_KEY_DELETE)) {
+        gb_safe_reset();
+    }
+    if (ctrlPressed && !altPressed && isInReport(report, HID_KEY_HOME)) {
+        clocks_reset_magic = CLOCKS_RESET_MAGIC;
+        __dmb();
         gb_safe_reset();
     }
     if (ctrlPressed || altPressed) {
@@ -1703,54 +1713,94 @@ static int save_slot = 0;
 #define CPU_FREQ 378
 #endif
 
-/* The clocks of the menu, MHz.  clk_sys: the PLL makes every step exactly
+/* The clocks of the menu.  clk_sys, MHz: the PLL makes every step exactly
  * (432, not 433: the PLL cannot make 433 MHz, set_sys_clock_khz() refused it
- * on RP2350 and panicked on RP2040).  The flash and the PSRAM get limits; their
- * dividers follow clk_sys (clocks.c, psram.c). */
+ * on RP2350 and panicked on RP2040).  The flash: RP2350 a limit in MHz (the
+ * divider follows clk_sys), RP2040 the SSI divider itself.  The PSRAM: a
+ * limit in MHz (psram.c).  The core voltage (RP2350): Auto or as murm386. */
 #if PICO_RP2350
 static const uint16_t cpu_freqs[] = { 252, 378, 396, 404, 408, 412, 416, 420, 424, 432, 504, 528 };
+static const uint16_t flash_opts[] = { 66, 84, 100, 133, 166 }; // MHz limits
+static const int8_t volt_opts[] = { CLOCKS_VOLTAGE_AUTO, VREG_VOLTAGE_1_30, VREG_VOLTAGE_1_35,
+                                    VREG_VOLTAGE_1_40, VREG_VOLTAGE_1_50, VREG_VOLTAGE_1_60,
+                                    VREG_VOLTAGE_1_65, VREG_VOLTAGE_1_70, VREG_VOLTAGE_1_80 };
+static const char* const volt_labels[] = { "Auto", "1.30 V", "1.35 V", "1.40 V", "1.50 V",
+                                           "1.60 V", "1.65 V", "1.70 V", "1.80 V" };
 #else
 static const uint16_t cpu_freqs[] = { 252, 378, 396, 404, 408, 412, 416, 420, 424, 432 };
+static const uint16_t flash_opts[] = { 2, 4, 6, 8 }; // SSI dividers (even only)
 #endif
-static const uint16_t mem_freqs[] = { 66, 84, 100, 133, 166 }; // flash and PSRAM limits
+static const uint16_t psram_opts[] = { 66, 84, 100, 133, 166 }; // MHz limits
+/* config.ini: a different key for the different meaning (an old RP2040
+ * flash_freq in MHz is not taken for a divider) */
+#if PICO_RP2350
+#define CONFIG_FLASH_KEY "flash_freq"
+#else
+#define CONFIG_FLASH_KEY "flash_div"
+#endif
 
-static uint8_t freq_index(const uint16_t* list, const size_t count, const uint32_t mhz, const uint8_t fallback) {
+static uint8_t freq_index(const uint16_t* list, const size_t count, const uint32_t value, const uint8_t fallback) {
     for (size_t i = 0; i < count; i++)
-        if (list[i] == mhz) return (uint8_t)i;
+        if (list[i] == value) return (uint8_t)i;
     return fallback;
 }
 
-// the clocks in use (written to config.ini) ...
-static uint16_t cpu_mhz = CPU_FREQ;
-static uint16_t flash_mhz = CLOCKS_FLASH_DEFAULT_MHZ;
-static uint16_t psram_mhz = GB_PSRAM_DEFAULT_MHZ;
-// ... the ones config.ini asks for (applied once, after the SD card is up) ...
-static uint16_t cfg_cpu_mhz = CPU_FREQ;
-static uint16_t cfg_flash_mhz = CLOCKS_FLASH_DEFAULT_MHZ;
-static uint16_t cfg_psram_mhz = GB_PSRAM_DEFAULT_MHZ;
-// ... and the selection on the Clocks screen (A / START applies all three)
+struct clock_settings_t {
+    uint16_t cpu;   // MHz
+    uint16_t flash; // CLOCKS_FLASH_DEFAULT: RP2350 MHz limit, RP2040 divider
+    uint16_t psram; // MHz limit
+    int8_t voltage; // CLOCKS_VOLTAGE_AUTO or enum vreg_voltage (RP2350)
+    bool operator==(const clock_settings_t& o) const {
+        return cpu == o.cpu && flash == o.flash && psram == o.psram && voltage == o.voltage;
+    }
+    bool operator!=(const clock_settings_t& o) const { return !(*this == o); }
+};
+// the firmware's clocks: the start, Ctrl+Home, Select held at power-on
+static constexpr clock_settings_t clocks_default = {
+    CPU_FREQ, CLOCKS_FLASH_DEFAULT, GB_PSRAM_DEFAULT_MHZ, CLOCKS_VOLTAGE_AUTO
+};
+static clock_settings_t clocks_now = clocks_default; // in use (written to config.ini)
+static clock_settings_t clocks_cfg = clocks_default; // config.ini asks (applied once the SD card is up)
+// the selection on the Clocks screen (A / START applies all of it)
 static uint8_t cpu_index;
 static uint8_t flash_index;
 static uint8_t psram_index;
+static uint8_t volt_index;
 // what the flash and the PSRAM really get: clk_sys / an integer divider
 static char clocks_info_flash[32];
 static char clocks_info_psram[32];
+static char clocks_info_volt[32];
 
 #if !HWAY
 static i2s_config_t i2s_config;
 #endif
 
-/* the menu shows the clocks in use, not a selection left unapplied */
+/* the screen shows the clocks in use, not a selection left unapplied */
 static void clocks_menu_sync() {
-    cpu_index = freq_index(cpu_freqs, count_of(cpu_freqs), cpu_mhz, 0);
-    flash_index = freq_index(mem_freqs, count_of(mem_freqs), flash_mhz, 0);
-    psram_index = freq_index(mem_freqs, count_of(mem_freqs), psram_mhz, 0);
+    cpu_index = freq_index(cpu_freqs, count_of(cpu_freqs), clocks_now.cpu, 0);
+    flash_index = freq_index(flash_opts, count_of(flash_opts), clocks_now.flash, 0);
+    psram_index = freq_index(psram_opts, count_of(psram_opts), clocks_now.psram, 0);
+    volt_index = 0;
+#if PICO_RP2350
+    for (uint8_t i = 0; i < count_of(volt_opts); i++)
+        if (volt_opts[i] == clocks_now.voltage) volt_index = i;
+#endif
+}
+
+static clock_settings_t clocks_selected() {
+    clock_settings_t s = { cpu_freqs[cpu_index], flash_opts[flash_index], psram_opts[psram_index],
+                           CLOCKS_VOLTAGE_AUTO };
+#if PICO_RP2350
+    s.voltage = volt_opts[volt_index];
+#endif
+    return s;
 }
 
 static void clocks_info_update() {
     const uint32_t clk_mhz = clock_get_hz(clk_sys) / MHZ;
     const uint32_t flash_hz = clocks_flash_hz();
     const uint32_t psram_hz = gb_psram_clock_hz();
+    const uint32_t mv = clocks_voltage_mv();
     char line[32];
     // padded: a shorter line must cover the previous one
     if (flash_hz)
@@ -1765,22 +1815,23 @@ static void clocks_info_update() {
     else
         snprintf(line, sizeof line, "  no PSRAM");
     snprintf(clocks_info_psram, sizeof clocks_info_psram, "%-26s", line);
+    snprintf(line, sizeof line, "  core %lu.%02lu V", (unsigned long)(mv / 1000), (unsigned long)(mv % 1000 / 10));
+    snprintf(clocks_info_volt, sizeof clocks_info_volt, "%-26s", line);
 }
 
-/* clk_sys and the memory clocks while everything runs.  Core 1 (the video,
- * the input, maybe running from the flash) waits in RAM while the flash
- * timing changes; then every divider derived from clk_sys is set again, so
- * the picture, the sound, the pads and the SD card keep their rates (before,
- * the video clock moved with clk_sys and the monitor lost the picture). */
-static bool clocks_apply(const uint16_t cpu, const uint16_t flash, const uint16_t psram) {
+/* clk_sys, the core voltage and the memory clocks while everything runs.
+ * Core 1 (the video, the input, maybe running from the flash) waits in RAM
+ * while the flash timing changes; then every divider derived from clk_sys is
+ * set again, so the picture, the sound, the pads and the SD card keep their
+ * rates (before, the video clock moved with clk_sys and the monitor lost the
+ * picture). */
+static bool clocks_apply(const clock_settings_t& s) {
     const bool core1 = render_ready; // core 1 has started: the lockout has its victim
     if (core1) multicore_lockout_start_blocking();
-    const bool ok = clocks_set(cpu, flash);
+    const bool ok = clocks_set(s.cpu, s.flash, s.voltage);
     if (ok) {
-        cpu_mhz = cpu;
-        flash_mhz = flash;
-        psram_mhz = psram;
-        gb_psram_set_max_mhz(psram);
+        clocks_now = s;
+        gb_psram_set_max_mhz(s.psram);
         gb_psram_reclock(); // no-op without PSRAM
         graphics_reclock();
 #if HWAY
@@ -3075,13 +3126,20 @@ static void f_load_conf(void) {
 #endif
             else if (!strcmp(line, "palette_all")) palette_all = d <= PALETTE_CUSTOM ? (uint8_t)d : PALETTE_AUTO;
             else if (!strcmp(line, "palette_list")) palette_list = d;
-            // clocks: only the menu values; anything else keeps the firmware's
+            // clocks: only the values of the Clocks screen; anything else keeps the firmware's
             else if (!strcmp(line, "cpu_freq") && freq_index(cpu_freqs, count_of(cpu_freqs), d, 0xff) != 0xff)
-                cfg_cpu_mhz = (uint16_t)d;
-            else if (!strcmp(line, "flash_freq") && freq_index(mem_freqs, count_of(mem_freqs), d, 0xff) != 0xff)
-                cfg_flash_mhz = (uint16_t)d;
-            else if (!strcmp(line, "psram_freq") && freq_index(mem_freqs, count_of(mem_freqs), d, 0xff) != 0xff)
-                cfg_psram_mhz = (uint16_t)d;
+                clocks_cfg.cpu = (uint16_t)d;
+            else if (!strcmp(line, CONFIG_FLASH_KEY) && freq_index(flash_opts, count_of(flash_opts), d, 0xff) != 0xff)
+                clocks_cfg.flash = (uint16_t)d;
+            else if (!strcmp(line, "psram_freq") && freq_index(psram_opts, count_of(psram_opts), d, 0xff) != 0xff)
+                clocks_cfg.psram = (uint16_t)d;
+#if PICO_RP2350
+            else if (!strcmp(line, "voltage")) {
+                const long v = strtol(val, nullptr, 10); // -1: Auto
+                for (const int8_t o : volt_opts)
+                    if (o == v) clocks_cfg.voltage = o;
+            }
+#endif
             else if (!strcmp(line, "palette16"))
                 palette16_global = palette16_select = d <= PALETTE16_CUSTOM ? (uint8_t)d : 0;
             else if (!strcmp(line, "custom16")) {
@@ -3165,8 +3223,12 @@ static void f_save_conf(void) {
         len += snprintf(text + len, sizeof text - len, "tv_color=%u\r\ngray_lines=%u\r\ngray_level=%u\r\npalette_list=%u\r\n",
                         (unsigned)tv_color, (unsigned)gray_lines, (unsigned)gray_level, PALETTE_LIST_VERSION);
     if (len > 0 && len < (int)sizeof text)
-        len += snprintf(text + len, sizeof text - len, "cpu_freq=%u\r\nflash_freq=%u\r\npsram_freq=%u\r\n",
-                        (unsigned)cpu_mhz, (unsigned)flash_mhz, (unsigned)psram_mhz);
+        len += snprintf(text + len, sizeof text - len, "cpu_freq=%u\r\n" CONFIG_FLASH_KEY "=%u\r\npsram_freq=%u\r\n",
+                        (unsigned)clocks_now.cpu, (unsigned)clocks_now.flash, (unsigned)clocks_now.psram);
+#if PICO_RP2350
+    if (len > 0 && len < (int)sizeof text)
+        len += snprintf(text + len, sizeof text - len, "voltage=%d\r\n", (int)clocks_now.voltage);
+#endif
 #if BACKPLANE
     if (len > 0 && len < (int)sizeof text)
         len += snprintf(text + len, sizeof text - len, "backplane=%u\r\nbackplane_skin=%u\r\n",
@@ -3352,18 +3414,25 @@ static void cheat_menu() {
     }
 }
 
-/* The clocks: clk_sys and the limits of the flash and the PSRAM, with what
- * the memories really get (clk_sys / an integer) under each.  A / START
- * applies all three while everything runs; they are saved with the settings.
+/* The clocks: clk_sys, the core voltage (RP2350), the flash and the PSRAM
+ * (RP2350 with PSRAM), with what each really gets under it.  A / START
+ * applies all of it while everything runs; leaving the screen after a
+ * successful apply saves it in config.ini.
  * Lines up to 38 characters: TV-SOFT NTSC has about 40 columns. */
 static void clocks_menu() {
+    enum { ITEM_CPU, ITEM_VOLT, ITEM_FLASH, ITEM_PSRAM };
+    uint8_t items[4];
+    unsigned count = 0;
+    items[count++] = ITEM_CPU;
+#if PICO_RP2350
+    items[count++] = ITEM_VOLT;
+#endif
+    items[count++] = ITEM_FLASH;
+    if (gb_psram_available()) items[count++] = ITEM_PSRAM;
+
     clocks_menu_sync();
     clocks_info_update();
-#if PICO_RP2350
-    const unsigned items = gb_psram_available() ? 3 : 2;
-#else
-    const unsigned items = 2;
-#endif
+    bool applied = false;
     unsigned cursor = 0;
     uint8_t previous = input_held();
     draw_window("Clocks", 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS);
@@ -3373,37 +3442,57 @@ static void clocks_menu() {
         previous = held;
         if ((pressed & BTN_B) || filebrowser_toggle_requested) {
             filebrowser_toggle_requested = false;
+            if (applied) f_save_conf(); // the clocks work: keep them
             return;
         }
-        if ((pressed & BTN_DOWN) && cursor + 1 < items) ++cursor;
+        if ((pressed & BTN_DOWN) && cursor + 1 < count) ++cursor;
         if ((pressed & BTN_UP) && cursor) --cursor;
-        uint8_t* const value = cursor == 0 ? &cpu_index : cursor == 1 ? &flash_index : &psram_index;
-        const unsigned max = cursor == 0 ? count_of(cpu_freqs) - 1 : count_of(mem_freqs) - 1;
+        uint8_t* value = &cpu_index;
+        unsigned max = count_of(cpu_freqs) - 1;
+        switch (items[cursor]) {
+            case ITEM_FLASH: value = &flash_index; max = count_of(flash_opts) - 1; break;
+            case ITEM_PSRAM: value = &psram_index; max = count_of(psram_opts) - 1; break;
+#if PICO_RP2350
+            case ITEM_VOLT: value = &volt_index; max = count_of(volt_opts) - 1; break;
+#endif
+            default: break;
+        }
         if ((pressed & BTN_RIGHT) && *value < max) ++*value;
         if ((pressed & BTN_LEFT) && *value) --*value;
         if (pressed & (BTN_A | BTN_START)) {
-            clocks_apply(cpu_freqs[cpu_index], mem_freqs[flash_index], mem_freqs[psram_index]);
+            if (clocks_apply(clocks_selected())) applied = true;
             clocks_menu_sync(); // a clock the PLL cannot make leaves the old one
         }
 
+        const auto colour = [&](const uint8_t item) { return items[cursor] == item ? 0 : 7; };
+        const auto bg = [&](const uint8_t item) { return items[cursor] == item ? 15 : 0; };
         char line[TEXT_BUFFER_COLS];
         snprintf(line, sizeof line, "CPU clock:  %3u MHz", (unsigned)cpu_freqs[cpu_index]);
-        draw_text(line, 2, 2, cursor == 0 ? 0 : 7, cursor == 0 ? 15 : 0);
-        snprintf(line, sizeof line, "Flash max:  %3u MHz", (unsigned)mem_freqs[flash_index]);
-        draw_text(line, 2, 4, cursor == 1 ? 0 : 7, cursor == 1 ? 15 : 0);
-        draw_text(clocks_info_flash, 2, 5, 6, 0);
+        draw_text(line, 2, 2, colour(ITEM_CPU), bg(ITEM_CPU));
 #if PICO_RP2350
-        snprintf(line, sizeof line, "PSRAM max:  %3u MHz", (unsigned)mem_freqs[psram_index]);
-        draw_text(line, 2, 7, cursor == 2 ? 0 : items > 2 ? 7 : 6, cursor == 2 ? 15 : 0);
-        draw_text(clocks_info_psram, 2, 8, 6, 0);
+        snprintf(line, sizeof line, "Voltage:    %-6s", volt_labels[volt_index]);
+        draw_text(line, 2, 3, colour(ITEM_VOLT), bg(ITEM_VOLT));
 #endif
-        draw_text("Left/Right: change  A/Start: apply", 2, 10, 7, 0);
-        draw_text("B: back", 2, 11, 7, 0);
-        draw_text("Flash and PSRAM run at the CPU", 2, 13, 7, 0);
-        draw_text("clock / an integer; \"max\" is the", 2, 14, 7, 0);
-        draw_text("highest clock the chip may get.", 2, 15, 7, 0);
-        draw_text("Select held at power-on starts", 2, 17, 7, 0);
-        draw_text("with the firmware's clocks.", 2, 18, 7, 0);
+        draw_text(clocks_info_volt, 2, 4, 6, 0);
+#if PICO_RP2350
+        snprintf(line, sizeof line, "Flash max:  %3u MHz", (unsigned)flash_opts[flash_index]);
+#else
+        snprintf(line, sizeof line, "Flash div:  %3u    ", (unsigned)flash_opts[flash_index]);
+#endif
+        draw_text(line, 2, 6, colour(ITEM_FLASH), bg(ITEM_FLASH));
+        draw_text(clocks_info_flash, 2, 7, 6, 0);
+#if PICO_RP2350
+        snprintf(line, sizeof line, "PSRAM max:  %3u MHz", (unsigned)psram_opts[psram_index]);
+        draw_text(line, 2, 9, gb_psram_available() ? colour(ITEM_PSRAM) : 6, bg(ITEM_PSRAM));
+        draw_text(clocks_info_psram, 2, 10, 6, 0);
+#endif
+        draw_text("Left/Right: change  A/Start: apply", 2, 12, 7, 0);
+        draw_text("B: back (saves what was applied)", 2, 13, 7, 0);
+        draw_text("Flash and PSRAM run at the CPU", 2, 15, 7, 0);
+        draw_text("clock divided by an integer.", 2, 16, 7, 0);
+        draw_text("No picture: Ctrl+Home restarts", 2, 18, 7, 0);
+        draw_text("with the firmware's clocks; so", 2, 19, 7, 0);
+        draw_text("does Select held at power-on.", 2, 20, 7, 0);
         sleep_ms(25);
     }
 }
@@ -3602,7 +3691,7 @@ void menu() {
                     break;
                 case CLOCKS:
                     // padded: the line is drawn over the previous one
-                    snprintf(result, TEXTMODE_COLS, "Clocks: %u MHz, flash %lu MHz  ", (unsigned)cpu_mhz,
+                    snprintf(result, TEXTMODE_COLS, "Clocks: %u MHz, flash %lu MHz  ", (unsigned)clocks_now.cpu,
                              (unsigned long)((clocks_flash_hz() + MHZ / 2) / MHZ));
                     break;
                 case HARD_RESET:
@@ -3700,12 +3789,15 @@ static void game_video_reset() {
 }
 
 int main() {
+    // Ctrl+Home rebooted the board: start with the firmware's clocks
+    const bool clocks_reset = clocks_reset_magic == CLOCKS_RESET_MAGIC;
+    clocks_reset_magic = 0;
     detect_flash_size();
-    /* The firmware's clock with the safe flash limit: every divider below is
-     * derived from clk_sys.  The clocks saved in config.ini follow once the
-     * SD card is up (clocks_apply() then sets the dividers again). */
-    if (!clocks_set(CPU_FREQ, CLOCKS_FLASH_DEFAULT_MHZ))
-        cpu_mhz = (uint16_t)(clock_get_hz(clk_sys) / MHZ);
+    /* The firmware's clocks: every divider below is derived from clk_sys.
+     * The clocks saved in config.ini follow once the SD card is up
+     * (clocks_apply() then sets the dividers again). */
+    if (!clocks_set(clocks_default.cpu, clocks_default.flash, clocks_default.voltage))
+        clocks_now.cpu = (uint16_t)(clock_get_hz(clk_sys) / MHZ);
     /* QMI CS1 setup before core1 starts: the probe briefly blocks XIP */
     gb_psram_init();
 
@@ -3751,12 +3843,14 @@ int main() {
         f_mkdir(HOME_DIR);
         f_load_conf();
         apply_video_settings();
-        /* The clocks of config.ini.  SELECT (Backspace / Esc, the pad's
-         * Select) held at power-on keeps the firmware's ones, for a board
-         * that hangs with the saved clocks; the next save then writes them. */
-        if (!(input_held() & BTN_SELECT) &&
-            (cfg_cpu_mhz != cpu_mhz || cfg_flash_mhz != flash_mhz || cfg_psram_mhz != psram_mhz))
-            clocks_apply(cfg_cpu_mhz, cfg_flash_mhz, cfg_psram_mhz);
+        /* The clocks of config.ini.  Ctrl+Home (no picture) or SELECT
+         * (Backspace / Esc, the pad's Select) held at power-on (a board that
+         * hangs) keep the firmware's ones, written to config.ini at once. */
+        if (clocks_reset || (input_held() & BTN_SELECT)) {
+            if (clocks_cfg != clocks_now) f_save_conf();
+        } else if (clocks_cfg != clocks_now) {
+            clocks_apply(clocks_cfg);
+        }
     }
 
     bool browser_rom_preloaded = false;

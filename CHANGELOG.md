@@ -1,8 +1,8 @@
 # Unreleased
-- Clocks screen instead of Overclocking: the CPU clock, the flash and the PSRAM clock limits, with the clocks the memories really get (CPU clock / an integer)
+- Clocks screen instead of Overclocking: the CPU clock, the core voltage (RP2350: Auto or 1.30..1.80 V, as murm386), the flash (RP2350: a limit in MHz, RP2040: the divider) and the PSRAM clock limit, with the clocks and the voltage really in use
 - clocks applied while running: the video, sound, NES pad, PS/2 keyboard, SD card and HW AY clocks follow the CPU clock (before, overclocking from the menu moved the video clock and the monitor lost the picture)
-- clocks saved in config.ini (cpu_freq, flash_freq, psram_freq); SELECT held at power-on starts with the firmware's clocks
-- the flash starts at most at 66 MHz (before: CPU clock / 2..4, 126..144 MHz)
+- clocks saved in config.ini on leaving the Clocks screen after a successful apply (cpu_freq, flash_freq / flash_div, psram_freq, voltage); Ctrl+Home (no picture) or SELECT held at power-on (a hang) restarts with the firmware's clocks and saves them
+- RP2350: the flash starts at most at 66 MHz (before: CPU clock / 2..4, 126..144 MHz); RP2040: divider 4, as before
 - every CPU step in every firmware (252 MHz firmwares jumped to 396, 504 MHz ones had only 528)
 - 432 MHz instead of 433, which the PLL cannot make (RP2040 panicked on it)
 - RP2040: the flash divider survives writing a cartridge to flash (boot2 set its own)

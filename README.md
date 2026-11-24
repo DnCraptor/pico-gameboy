@@ -123,23 +123,28 @@ Selecting a `.gbbp` file installs it as the backplane (see below).
 
 - **CPU clock**: 252, 378, 396 … 432 MHz (RP2350 also 504 and 528). The
   firmware starts at the clock in its file name.
-- **Flash max**: 66, 84, 100, 133 or 166 MHz — the highest clock the flash
-  chip may get (66 at start). The flash runs at the CPU clock divided by an
-  integer; the line under it shows the result, for example
+- **Voltage** (RP2350): Auto (1.70 V above 378 MHz, otherwise 1.60 V) or
+  1.30 … 1.80 V; the line under it shows the core voltage in use. RP2040
+  runs at 1.30 V.
+- **Flash max** (RP2350): 66, 84, 100, 133 or 166 MHz — the highest clock
+  the flash chip may get (66 at start). The flash runs at the CPU clock
+  divided by an integer; the line under it shows the result, for example
   `flash 63 MHz = 378/6`. Cartridges in flash (no PSRAM) run faster with a
   higher limit, if the chip takes it.
-- **PSRAM max** (RP2350 with PSRAM): the same for the PSRAM (133 at start).
+- **Flash div** (RP2040): the flash divider itself, 2, 4, 6 or 8 (4 at
+  start, as before); the line under it shows the flash clock.
+- **PSRAM max** (RP2350 with PSRAM): as Flash max, for the PSRAM (133 at
+  start).
 
-Left / Right change a value, A / START applies all three while the
-emulator runs: the clocks of the picture, the sound, the NES pad, the PS/2
-keyboard and the SD card are set again for the new CPU clock. The core
-voltage follows the CPU clock (RP2350: 1.70 V above 378 MHz, otherwise
-1.60 V; RP2040: 1.30 V).
+Left / Right change a value, A / START applies all of it while the emulator
+runs: the clocks of the picture, the sound, the NES pad, the PS/2 keyboard
+and the SD card are set again for the new CPU clock. Leaving the screen
+(B) after a successful apply saves the clocks in `config.ini`; they are
+applied once the SD card is mounted.
 
-The clocks are saved with the settings and applied once the SD card is
-mounted. If a board hangs with the saved clocks, hold SELECT (Backspace /
-Esc, or Select on the pad) while switching it on: it starts with the
-firmware's clocks, and the next save writes them.
+If the saved clocks give no picture, press **Ctrl+Home**: the board restarts
+with the firmware's clocks and saves them. If it hangs, hold SELECT
+(Backspace / Esc, or Select on the pad) while switching it on: the same.
 
 ## Game Genie
 
@@ -280,8 +285,9 @@ closed): `swap_ab`, `tv_system`, `tv_color`, `screen`, `palette_all`,
 `backplane`, `backplane_skin`, `gray_lines`, `gray_level`, `palette_list` (the numbering of
 the palettes: without `palette_list=2` the numbers after DMG are those
 from before the Super Game Boy palettes and are moved up by 30),
-`cpu_freq`, `flash_freq`, `psram_freq` (MHz; only the values of the
-**Clocks** screen, others are ignored). Unknown keys are ignored.
+`cpu_freq`, `flash_freq` (RP2040: `flash_div`), `psram_freq`, `voltage`
+(RP2350; `-1` Auto, otherwise the SDK `vreg_voltage` value) — only the
+values of the **Clocks** screen, others are ignored. Unknown keys are ignored.
 
 ## Building
 
@@ -332,7 +338,7 @@ RP2350 variant into `bin/rp2350/Release/`:
 Hold BOOTSEL, connect the Pico to a computer and copy the `.uf2` file to the
 `RP2350` drive, or start it from a firmware manager (pico-launcher, MOS2).
 The CPU runs at the clock in the file name (252, 378 or 504 MHz), the flash
-at most at 66 MHz; **Clocks** in the menu changes them (see
+at most at 66 MHz (RP2040: CPU clock / 4); **Clocks** in the menu changes them (see
 [Clocks](#clocks)).
 
 ## Default hardware pin assignments
